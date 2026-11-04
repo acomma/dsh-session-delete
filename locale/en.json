@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Delete",
+    "description": "Adds Delete session to every session's … menu, permanently removes the stored log from disk, and reclaims attachments only that session referenced (on by default)."
+  }
+}
