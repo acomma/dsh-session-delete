@@ -4,13 +4,16 @@
  * Adds one destructive row to every Session's "..." menu and owns the
  * confirmation dialog. Both the menu row and the dialog live in slots owned by
  * the shipped Workspace browser and shell overlay; this module only projects
- * its own state into them. Deletion itself is the Host route
- * `api/session.delete`, which applies the live-Session refusal.
+ * its own state into them. The row and dialog reuse the shipped ui-primitives
+ * so they behave like the built-in archive and delete surfaces. Deletion itself
+ * is the Host route `api/session.delete`, which applies the live-Session
+ * refusal.
  */
 window.__ModuleLoader__.load({
   id: '@local/dsh-session-delete',
   factory(require) {
     const React = require('react')
+    const { Button, IconTrashOutlineRegular, MenuItemButton, Modal } = require('@deepseek-ai/dsh-client-ui-primitives')
     const h = React.createElement
 
     const NS = 'session-delete'
@@ -84,8 +87,8 @@ window.__ModuleLoader__.load({
       'error.http': 'The delete request failed (HTTP {status}).',
     }
 
-    /** One pending confirmation, shared by the menu row and the overlay dialog. */
-    let state = {
+    /** One closed confirmation: the shared starting point for every transition. */
+    const CLOSED = Object.freeze({
       open: false,
       phase: 'confirm',
       sessionId: null,
@@ -95,7 +98,9 @@ window.__ModuleLoader__.load({
       deleteAttachments: true,
       /** Attachment report of the last successful deletion, when one ran. */
       attachments: null,
-    }
+    })
+    /** One pending confirmation, shared by the menu row and the overlay dialog. */
+    let state = CLOSED
     const listeners = new Set()
 
     function subscribe(listener) {
@@ -118,27 +123,16 @@ window.__ModuleLoader__.load({
 
     function requestDelete(sessionId, displayTitle) {
       publish({
+        ...CLOSED,
         open: true,
-        phase: 'confirm',
         sessionId,
         title: typeof displayTitle === 'string' ? displayTitle : '',
-        error: null,
-        deleteAttachments: true,
-        attachments: null,
       })
     }
 
     function dismiss() {
       if (state.phase === 'deleting') return
-      publish({
-        open: false,
-        phase: 'confirm',
-        sessionId: null,
-        title: '',
-        error: null,
-        deleteAttachments: true,
-        attachments: null,
-      })
+      publish(CLOSED)
     }
 
     /**
@@ -156,7 +150,7 @@ window.__ModuleLoader__.load({
         response = await fetch(ROUTE, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(deleteAttachments === true ? { sessionId, deleteAttachments: true } : { sessionId }),
+          body: JSON.stringify({ sessionId, deleteAttachments: deleteAttachments === true }),
           signal: controller.signal,
         })
       } catch (error) {
@@ -206,54 +200,19 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /**
-     * The trash glyph the shipped "Delete workspace" row renders
-     * (ui-primitives `IconTrashOutlineRegular`): a 16-unit outline drawn one
-     * pixel wide, with the same five strokes, so both delete rows read as one
-     * icon family. Copied rather than imported — a client bundle must not
-     * require a Harness Client package.
-     */
-    function DeleteIcon() {
-      return h('svg', {
-        className: 'dsh-session-delete__menu-icon',
-        width: 14,
-        height: 14,
-        viewBox: '0 0 16 16',
-        fill: 'none',
-        xmlns: 'http://www.w3.org/2000/svg',
-        'aria-hidden': 'true',
-        focusable: 'false',
-        strokeWidth: 1,
-      },
-      h('path', { d: 'M1.28149 3.88831H14.7187', stroke: 'currentColor' }),
-      h('path', {
-        d: 'M5.41602 3.88833V2.47962C5.41602 2.29282 5.52492 2.11366 5.71876 1.98157C5.9126 1.84948 6.17551 1.77527 6.44964 1.77527H9.55053C9.82466 1.77527 10.0876 1.84948 10.2814 1.98157C10.4753 2.11366 10.5842 2.29282 10.5842 2.47962V3.88833',
-        stroke: 'currentColor',
-      }),
-      h('path', {
-        d: 'M2.57349 3.88831L3.19366 13.2943C3.21937 13.5502 3.33952 13.7872 3.53065 13.9593C3.72178 14.1313 3.97016 14.2259 4.22729 14.2246H11.7728C12.0299 14.2259 12.2783 14.1313 12.4694 13.9593C12.6605 13.7872 12.7807 13.5502 12.8064 13.2943L13.4266 3.88831',
-        stroke: 'currentColor',
-      }),
-      h('path', { d: 'M6.44946 6.98926V11.1238', stroke: 'currentColor' }),
-      h('path', { d: 'M9.55054 6.98926V11.1238', stroke: 'currentColor' }))
-    }
-
     /** One destructive row at the end of a Session's "..." menu. */
     function DeleteSessionMenuItem(props) {
       const { sessionId, displayTitle, useMenuOpenState, requestDelete: openDelete, t: translate } = props
       const t = typeof translate === 'function' ? translate : (key) => key
       const [, setMenuOpen] = useMenuOpenState()
-      return h('button', {
-        type: 'button',
-        role: 'menuitem',
-        className: 'dsh-session-delete__menu-item',
-        onClick: () => {
+      return h(MenuItemButton, {
+        danger: true,
+        icon: h(IconTrashOutlineRegular, { size: 14 }),
+        onSelect: () => {
           setMenuOpen(false)
           openDelete(sessionId, displayTitle)
         },
-      },
-      h(DeleteIcon),
-      h('span', { className: 'dsh-session-delete__menu-label' }, t('menu.delete')))
+      }, t('menu.delete'))
     }
 
     /** Byte count in the dialog's compact unit form. */
@@ -296,65 +255,10 @@ window.__ModuleLoader__.load({
       return h('p', { key: 'attachments', className: 'dsh-session-delete__body' }, parts.join(' '))
     }
 
-    /** Frame-wide confirmation and success dialog. */
+    /** Frame-wide confirmation and success dialog, rendered by the shipped Modal. */
     function DeleteSessionDialog({ t: translate }) {
       const t = typeof translate === 'function' ? translate : (key) => key
       const current = useDeleteState()
-      const cancelRef = React.useRef(null)
-      const closeRef = React.useRef(null)
-      const dialogRef = React.useRef(null)
-      const restoreRef = React.useRef(null)
-      const phaseRef = React.useRef(current.phase)
-      phaseRef.current = current.phase
-
-      React.useEffect(() => {
-        if (!current.open) return undefined
-        const previous = document.activeElement
-        restoreRef.current = previous
-        const previousOverflow = document.body.style.overflow
-        document.body.style.overflow = 'hidden'
-
-        const onKeyDown = (event) => {
-          if (event.key === 'Escape' && phaseRef.current !== 'deleting') {
-            event.preventDefault()
-            dismiss()
-            return
-          }
-          if (event.key !== 'Tab' || dialogRef.current === null) return
-          const focusable = dialogRef.current.querySelectorAll(
-            'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-          )
-          if (focusable.length === 0) return
-          const first = focusable[0]
-          const last = focusable[focusable.length - 1]
-          if (event.shiftKey && document.activeElement === first) {
-            event.preventDefault()
-            last.focus()
-          } else if (!event.shiftKey && document.activeElement === last) {
-            event.preventDefault()
-            first.focus()
-          }
-        }
-
-        document.addEventListener('keydown', onKeyDown)
-        const frame = requestAnimationFrame(() => {
-          if (cancelRef.current !== null) cancelRef.current.focus()
-        })
-        return () => {
-          cancelAnimationFrame(frame)
-          document.removeEventListener('keydown', onKeyDown)
-          document.body.style.overflow = previousOverflow
-          restoreRef.current = null
-          if (previous !== null && typeof previous.focus === 'function') previous.focus()
-        }
-      }, [current.open])
-
-      React.useEffect(() => {
-        if (current.open && current.phase === 'success' && closeRef.current !== null) {
-          closeRef.current.focus()
-        }
-      }, [current.open, current.phase])
-
       if (!current.open) return null
 
       const success = current.phase === 'success'
@@ -362,7 +266,7 @@ window.__ModuleLoader__.load({
       const title = current.title === '' ? t('dialog.untitled') : current.title
 
       const onConfirm = async () => {
-        if (phaseRef.current === 'deleting') return
+        if (state.phase === 'deleting') return
         const sessionId = current.sessionId
         const deleteAttachments = current.deleteAttachments
         publish({ phase: 'deleting', error: null })
@@ -373,6 +277,26 @@ window.__ModuleLoader__.load({
         }
         publish({ phase: 'confirm', error: result })
       }
+
+      const footer = success
+        ? h(Button, { key: 'close', variant: 'primary', autoFocus: true, onClick: dismiss }, t('dialog.close'))
+        : h(React.Fragment, null,
+            h(Button, {
+              key: 'cancel',
+              variant: 'outline',
+              disabled: deleting,
+              'data-modal-autofocus': true,
+              onClick: dismiss,
+            }, t('dialog.cancel')),
+            h(Button, {
+              key: 'confirm',
+              variant: 'outline',
+              className: 'dsh-session-delete__danger',
+              disabled: deleting,
+              onClick: onConfirm,
+            }, deleting
+              ? (current.deleteAttachments === true ? t('dialog.deletingAttachments') : t('dialog.deleting'))
+              : t('dialog.confirm')))
 
       const option = h('label', {
         key: 'attachments',
@@ -386,16 +310,13 @@ window.__ModuleLoader__.load({
         onChange: (event) => publish({ deleteAttachments: event.target.checked === true }),
       }),
       h('span', { className: 'dsh-session-delete__optionText' },
-        h('span', { className: 'dsh-session-delete__optionTitle' }, t('dialog.attachments')),
+        h('span', null, t('dialog.attachments')),
         h('span', { className: 'dsh-session-delete__optionHint' }, t('dialog.attachmentsHint'))))
 
+      const summary = success ? attachmentSummary(current.attachments, t) : null
       const body = success
-        ? [
-            h('p', { key: 'success', className: 'dsh-session-delete__body' }, t('dialog.successDescription')),
-            attachmentSummary(current.attachments, t),
-          ]
+        ? (summary === null ? [] : [summary])
         : [
-            h('p', { key: 'description', className: 'dsh-session-delete__body' }, t('dialog.description', { title })),
             h('p', { key: 'warning', className: 'dsh-session-delete__warning' }, t('dialog.warning')),
             option,
             current.error === null
@@ -403,143 +324,36 @@ window.__ModuleLoader__.load({
               : h('p', { key: 'error', className: 'dsh-session-delete__error', role: 'alert' }, errorText(current.error, t)),
           ]
 
-      const actions = success
-        ? [
-            h('button', {
-              key: 'close',
-              ref: closeRef,
-              type: 'button',
-              className: 'dsh-session-delete__button dsh-session-delete__button--primary',
-              onClick: dismiss,
-              autoFocus: true,
-            }, t('dialog.close')),
-          ]
-        : [
-            h('button', {
-              key: 'cancel',
-              ref: cancelRef,
-              type: 'button',
-              className: 'dsh-session-delete__button',
-              onClick: dismiss,
-              disabled: deleting,
-            }, t('dialog.cancel')),
-            h('button', {
-              key: 'confirm',
-              type: 'button',
-              className: 'dsh-session-delete__button dsh-session-delete__button--danger',
-              onClick: onConfirm,
-              disabled: deleting,
-            }, deleting
-              ? (current.deleteAttachments === true ? t('dialog.deletingAttachments') : t('dialog.deleting'))
-              : t('dialog.confirm')),
-          ]
-
-      return h('div', {
-        className: 'dsh-session-delete__scrim',
-        onMouseDown: (event) => {
-          if (event.target === event.currentTarget && !deleting) dismiss()
-        },
-      }, h('div', {
-        ref: dialogRef,
-        className: 'dsh-session-delete__dialog',
-        role: 'dialog',
-        'aria-modal': 'true',
-        'aria-labelledby': 'dsh-session-delete-title',
-        'aria-describedby': 'dsh-session-delete-body',
-      },
-      h('h2', {
-        id: 'dsh-session-delete-title',
-        className: 'dsh-session-delete__title',
-      }, success ? t('dialog.successTitle') : t('dialog.title')),
-      h('div', { id: 'dsh-session-delete-body' }, body),
-      h('div', { className: 'dsh-session-delete__actions' }, actions)))
+      return h(Modal, {
+        open: true,
+        onClose: dismiss,
+        closeLabel: t('dialog.close'),
+        title: success ? t('dialog.successTitle') : t('dialog.title'),
+        description: success
+          ? t('dialog.successDescription')
+          : t('dialog.description', { title }),
+        footer,
+      }, ...body)
     }
 
     const CSS = `
-.dsh-session-delete__menu-item {
-  box-sizing: border-box;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  min-height: 34px;
-  margin: 0;
-  padding: 6px 8px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
+.dsh-session-delete__warning {
+  margin: 0 0 14px;
   color: var(--dsw-alias-state-error-primary);
-  font: inherit;
   font-size: 13px;
   line-height: 20px;
-  text-align: start;
-  cursor: pointer;
-}
-.dsh-session-delete__menu-icon {
-  display: inline-flex;
-  flex: none;
-  width: 14px;
-  height: 14px;
-  align-items: center;
-  justify-content: center;
-}
-.dsh-session-delete__menu-label {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.dsh-session-delete__menu-item:hover {
-  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);
-}
-.dsh-session-delete__menu-item:focus-visible {
-  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);
-  outline: none;
-}
-.dsh-session-delete__scrim {
-  position: fixed;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: color-mix(in srgb, var(--dsw-alias-label-primary) 32%, transparent);
-  pointer-events: auto;
-}
-.dsh-session-delete__dialog {
-  box-sizing: border-box;
-  width: min(440px, 100%);
-  padding: 20px;
-  border: 1px solid var(--dsw-alias-border-l1);
-  border-radius: 12px;
-  background: var(--dsw-alias-bg-overlay);
-  color: var(--dsw-alias-label-primary);
-  box-shadow: 0 16px 48px color-mix(in srgb, var(--dsw-alias-label-primary) 24%, transparent);
-}
-.dsh-session-delete__title {
-  margin: 0 0 10px;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 600;
 }
 .dsh-session-delete__body {
-  margin: 0 0 8px;
+  margin: 0;
   color: var(--dsw-alias-label-secondary);
   font-size: 13px;
   line-height: 20px;
   overflow-wrap: anywhere;
 }
-.dsh-session-delete__warning {
-  margin: 0;
-  color: var(--dsw-alias-state-error-primary);
-  font-size: 13px;
-  line-height: 20px;
-}
 .dsh-session-delete__option {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  margin-top: 14px;
   color: var(--dsw-alias-label-primary);
   font-size: 13px;
   line-height: 20px;
@@ -567,60 +381,12 @@ window.__ModuleLoader__.load({
 }
 .dsh-session-delete__error {
   margin: 12px 0 0;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);
   color: var(--dsw-alias-state-error-primary);
-  font-size: 13px;
-  line-height: 20px;
+  font-size: 12px;
+  line-height: 18px;
 }
-.dsh-session-delete__actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 18px;
-}
-.dsh-session-delete__button {
-  box-sizing: border-box;
-  height: 32px;
-  padding: 0 14px;
-  border: 1px solid var(--dsw-alias-border-l1);
-  border-radius: 8px;
-  background: transparent;
-  color: var(--dsw-alias-label-primary);
-  font: inherit;
-  font-size: 13px;
-  line-height: 1;
-  cursor: pointer;
-}
-.dsh-session-delete__button:hover {
-  background: var(--dsw-alias-bg-layer-2);
-}
-.dsh-session-delete__button:focus-visible {
-  outline: 2px solid var(--dsw-alias-brand-primary);
-  outline-offset: 2px;
-}
-.dsh-session-delete__button:disabled {
-  opacity: 0.55;
-  cursor: default;
-}
-.dsh-session-delete__button--primary {
-  border-color: var(--dsw-alias-brand-primary);
-  background: var(--dsw-alias-brand-primary);
-  color: var(--dsw-alias-bg-base);
-}
-.dsh-session-delete__button--danger {
-  border-color: var(--dsw-alias-state-error-primary);
-  background: var(--dsw-alias-state-error-primary);
-  color: var(--dsw-alias-bg-base);
-}
-.dsh-session-delete__button--primary:hover {
-  background: var(--dsw-alias-brand-primary);
-  opacity: 0.9;
-}
-.dsh-session-delete__button--danger:hover {
-  background: var(--dsw-alias-state-error-primary);
-  opacity: 0.9;
+.dsh-session-delete__danger:not(:disabled) {
+  color: var(--dsw-alias-state-error-primary);
 }
 `
 

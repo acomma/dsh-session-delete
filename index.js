@@ -120,24 +120,22 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
 
   // Read what the tree references while its logs still exist: after the
   // directories are gone nothing can name the attachments that were in them.
-  const owned = deleteAttachments ? await readAttachmentRefs(ctx, tree.map((entry) => entry.id)) : undefined
+  const owned = deleteAttachments ? await readAttachmentRefs(persistence, tree) : undefined
 
   const root = sessionsRoot()
   const deleted = []
   const failed = []
-  let bytes = 0
 
-  for (const entry of tree) {
+  for (const id of tree) {
     try {
-      const outcome = await deleteSessionTree(root, entry.id)
+      const outcome = await deleteSessionTree(root, id)
       if (!outcome.found) {
-        failed.push({ sessionId: entry.id, code: 'directory-missing' })
+        failed.push({ sessionId: id, code: 'directory-missing' })
         continue
       }
-      deleted.push(entry.id)
-      bytes += entry.bytes
+      deleted.push(id)
     } catch (error) {
-      failed.push({ sessionId: entry.id, code: 'delete-failed', message: describe(error) })
+      failed.push({ sessionId: id, code: 'delete-failed', message: describe(error) })
     }
   }
 
@@ -146,10 +144,9 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
     return { ...failure(code, sessionId), failed }
   }
 
-  const removedEntries = tree.filter((entry) => deleted.includes(entry.id))
-  const schedules = await deleteSchedules(ctx, removedEntries)
-  const caches = await deleteProjectionCache(removedEntries)
-  const attachments = owned === undefined ? undefined : await settleAttachments(ctx, tree, deleted, owned)
+  const schedules = await deleteSchedules(ctx, deleted)
+  const caches = await deleteProjectionCache(deleted)
+  const attachments = owned === undefined ? undefined : await settleAttachments(persistence, tree, deleted, owned)
 
   // Announce that these Sessions left the catalog so a connected page drops
   // their rows immediately instead of keeping stale rows until a reload.
@@ -161,30 +158,20 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
     }
   }
 
-  if (failed.length > 0) {
-    return {
-      ok: false,
-      code: 'partial',
-      message: FAILURE_MESSAGES.partial,
-      sessionId,
-      deleted,
-      failed,
-      bytes,
-      schedules,
-      caches,
-      ...(attachments === undefined ? {} : { attachments }),
-    }
-  }
-
-  return {
-    ok: true,
+  const result = {
+    ok: failed.length === 0,
     sessionId,
     deleted,
-    bytes,
     schedules,
     caches,
     ...(attachments === undefined ? {} : { attachments }),
   }
+  if (failed.length > 0) {
+    result.code = 'partial'
+    result.message = FAILURE_MESSAGES.partial
+    result.failed = failed
+  }
+  return result
 }
 
 /**
@@ -193,15 +180,13 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
  * The read happens before any directory is removed. A Session whose log cannot
  * be read leaves the cleanup unverified: not knowing its references is not the
  * same as knowing it has none.
- * @param ctx - Host context carrying Session persistence.
+ * @param persistence - Session persistence service.
  * @param sessionIds - the tree being deleted.
  * @returns refs per Session id, plus the ids that could not be read.
  */
-async function readAttachmentRefs(ctx, sessionIds) {
-  const persistence = ctx.get('sessionPersistence')
+async function readAttachmentRefs(persistence, sessionIds) {
   const refs = new Map()
   const unreadable = []
-  if (persistence === undefined) return { refs, unreadable: [...sessionIds] }
   for (const id of sessionIds) {
     try {
       refs.set(id, await readSessionAttachmentRefs(persistence, id))
@@ -214,31 +199,44 @@ async function readAttachmentRefs(ctx, sessionIds) {
 
 /**
  * Collect every durable attachment reference from one stored Session log.
- *
- * Reads go through the persistence seam, which is the only reader that decodes
- * the compressed, possibly migrated log. The final read is empty, and progress
- * follows the event sequence numbers so a backend slice can never stall.
  * @param persistence - Session persistence service.
  * @param sessionId - stored Session to read.
  * @returns the attachment ids the Session references.
  */
 async function readSessionAttachmentRefs(persistence, sessionId) {
   const refs = new Set()
-  const handle = await persistence.open(sessionId, 'read')
+  await forEachEventBatch(persistence, sessionId, undefined, (events) => {
+    walkAttachmentRefs(events, (attachmentId) => {
+      refs.add(attachmentId)
+    })
+  })
+  return refs
+}
+
+/**
+ * Stream one stored Session's event batches through the persistence seam.
+ *
+ * The seam is the only reader that decodes the compressed, possibly migrated
+ * log. Progress follows the event sequence numbers so a backend slice can never
+ * stall, and the final empty read ends the walk.
+ * @param persistence - Session persistence service.
+ * @param sessionId - stored Session to read.
+ * @param options - optional cancellation forwarded to the open and read calls.
+ * @param visit - called with each non-empty batch; return true to stop early.
+ */
+async function forEachEventBatch(persistence, sessionId, options, visit) {
+  const handle = await persistence.open(sessionId, 'read', options)
   try {
     let offset = 0
     for (;;) {
-      const { events } = await handle.read(offset, REFERENCE_READ_CHUNK)
-      if (events.length === 0) break
-      walkAttachmentRefs(events, (attachmentId) => {
-        refs.add(attachmentId)
-      })
+      const { events } = await handle.read(offset, REFERENCE_READ_CHUNK, options)
+      if (events.length === 0) return
+      if (visit(events) === true) return
       offset = events[events.length - 1].seq + 1
     }
   } finally {
     await handle.close().catch(() => {})
   }
-  return refs
 }
 
 /**
@@ -278,18 +276,17 @@ function walkAttachmentRefs(roots, visit) {
  * of references is not proof. The scan stops early once every candidate is known
  * to be shared, and is budgeted so a huge catalog degrades to "keep everything"
  * instead of blocking the deletion.
- * @param ctx - Host context carrying Session persistence.
- * @param tree - the Session tree the deletion addressed.
+ * @param persistence - Session persistence service.
+ * @param tree - the Session ids the deletion addressed.
  * @param deletedIds - Sessions whose directory this request removed.
  * @param owned - attachment refs per tree Session, read before deletion.
  * @returns the attachment report carried by the response.
  */
-async function settleAttachments(ctx, tree, deletedIds, owned) {
-  const report = { status: 'applied', requested: true, deleted: 0, kept: 0, failed: 0, missing: 0, bytes: 0 }
-  const persistence = ctx.get('sessionPersistence')
-  if (persistence === undefined) return { ...report, status: 'unverified', reason: 'unavailable' }
+async function settleAttachments(persistence, tree, deletedIds, owned) {
+  const report = { status: 'applied', deleted: 0, kept: 0, failed: 0, missing: 0, bytes: 0 }
   if (owned.unreadable.length > 0) return { ...report, status: 'unverified', reason: 'unreadable' }
 
+  const deleted = new Set(deletedIds)
   const candidates = new Set()
   for (const id of deletedIds) {
     const refs = owned.refs.get(id)
@@ -298,18 +295,16 @@ async function settleAttachments(ctx, tree, deletedIds, owned) {
   }
   if (candidates.size === 0) return report
 
-  const deleted = new Set(deletedIds)
-  const referenced = new Set()
-  // A Session whose directory survived still owns every reference it held.
-  for (const entry of tree) {
-    if (deleted.has(entry.id)) continue
-    const refs = owned.refs.get(entry.id)
-    if (refs === undefined) continue
-    for (const attachmentId of refs) if (candidates.has(attachmentId)) referenced.add(attachmentId)
-  }
-
+  // `pending` is the candidates minus every reference a surviving Session still
+  // holds, so it also answers "was this candidate kept?" at the end.
   const pending = new Set(candidates)
-  for (const attachmentId of referenced) pending.delete(attachmentId)
+  // A Session whose directory survived still owns every reference it held.
+  for (const id of tree) {
+    if (deleted.has(id)) continue
+    const refs = owned.refs.get(id)
+    if (refs === undefined) continue
+    for (const attachmentId of refs) pending.delete(attachmentId)
+  }
 
   const controller = new AbortController()
   const timer = setTimeout(
@@ -333,10 +328,7 @@ async function settleAttachments(ctx, tree, deletedIds, owned) {
       } catch {
         return { ...report, status: 'unverified', reason: controller.signal.aborted ? 'timeout' : 'unreadable' }
       }
-      for (const attachmentId of found) {
-        referenced.add(attachmentId)
-        pending.delete(attachmentId)
-      }
+      for (const attachmentId of found) pending.delete(attachmentId)
     }
   } finally {
     clearTimeout(timer)
@@ -344,7 +336,7 @@ async function settleAttachments(ctx, tree, deletedIds, owned) {
 
   const root = attachmentsRoot()
   for (const attachmentId of candidates) {
-    if (referenced.has(attachmentId)) {
+    if (!pending.has(attachmentId)) {
       report.kept += 1
       continue
     }
@@ -373,21 +365,12 @@ async function settleAttachments(ctx, tree, deletedIds, owned) {
  */
 async function scanSessionForAttachments(persistence, sessionId, pending, signal) {
   const found = new Set()
-  const handle = await persistence.open(sessionId, 'read', { signal })
-  try {
-    let offset = 0
-    for (;;) {
-      const { events } = await handle.read(offset, REFERENCE_READ_CHUNK, { signal })
-      if (events.length === 0) break
-      walkAttachmentRefs(events, (attachmentId) => {
-        if (pending.has(attachmentId)) found.add(attachmentId)
-      })
-      offset = events[events.length - 1].seq + 1
-      if (found.size === pending.size) break
-    }
-  } finally {
-    await handle.close().catch(() => {})
-  }
+  await forEachEventBatch(persistence, sessionId, { signal }, (events) => {
+    walkAttachmentRefs(events, (attachmentId) => {
+      if (pending.has(attachmentId)) found.add(attachmentId)
+    })
+    return found.size === pending.size
+  })
   return found
 }
 
@@ -407,29 +390,20 @@ async function deleteAttachmentObject(root, attachmentId) {
   if (!ATTACHMENT_ID.test(attachmentId)) return { found: false, bytes: 0 }
   const digest = attachmentId.slice('sha256:'.length)
   const bucket = digest.slice(0, 2)
+  const targets = [
+    { path: join(root, 'objects', bucket, digest), directory: false },
+    { path: join(root, 'file-objects', bucket, digest), directory: false },
+    { path: join(root, 'files', bucket, digest), directory: true },
+  ]
   let found = false
   let bytes = 0
 
-  const imagePath = join(root, 'objects', bucket, digest)
-  const image = await statOrUndefined(imagePath)
-  if (image !== undefined && image.isFile() && !image.isSymbolicLink()) {
-    bytes += image.size
-    await rm(imagePath, { force: true })
-    found = true
-  }
-
-  const objectPath = join(root, 'file-objects', bucket, digest)
-  const object = await statOrUndefined(objectPath)
-  if (object !== undefined && object.isFile() && !object.isSymbolicLink()) {
-    bytes += object.size
-    await rm(objectPath, { force: true })
-    found = true
-  }
-
-  const aliasPath = join(root, 'files', bucket, digest)
-  const alias = await statOrUndefined(aliasPath)
-  if (alias !== undefined && alias.isDirectory() && !alias.isSymbolicLink()) {
-    await rm(aliasPath, { recursive: true, force: true })
+  for (const target of targets) {
+    const entry = await statOrUndefined(target.path)
+    if (entry === undefined || entry.isSymbolicLink()) continue
+    if (target.directory ? !entry.isDirectory() : !entry.isFile()) continue
+    if (!target.directory) bytes += entry.size
+    await rm(target.path, { recursive: target.directory, force: true })
     found = true
   }
 
@@ -466,9 +440,18 @@ async function statOrUndefined(path) {
  * implied by deleting the parent.
  * @param byId - stored snapshots keyed by Session id.
  * @param rootId - requested root Session.
- * @returns root first, then each owned descendant.
+ * @returns root first, then the id of each owned descendant.
  */
 function collectTree(byId, rootId) {
+  const childrenOf = new Map()
+  for (const [id, snapshot] of byId) {
+    if (snapshot.header.origin !== 'subagent') continue
+    const parentId = String(snapshot.header.parentSession ?? '')
+    const children = childrenOf.get(parentId)
+    if (children === undefined) childrenOf.set(parentId, [id])
+    else children.push(id)
+  }
+
   const tree = []
   const seen = new Set()
   const queue = [{ id: rootId, depth: 0 }]
@@ -476,15 +459,10 @@ function collectTree(byId, rootId) {
     const { id, depth } = queue.shift()
     if (seen.has(id)) continue
     seen.add(id)
-    const snapshot = byId.get(id)
-    if (snapshot === undefined) continue
-    tree.push({ id, bytes: snapshot.sizeBytes ?? 0 })
+    tree.push(id)
     if (depth >= MAX_TREE_DEPTH) continue
-    for (const [candidateId, candidate] of byId) {
-      if (candidate.header.origin !== 'subagent') continue
-      if (String(candidate.header.parentSession ?? '') !== id) continue
-      if (seen.has(candidateId)) continue
-      queue.push({ id: candidateId, depth: depth + 1 })
+    for (const childId of childrenOf.get(id) ?? []) {
+      if (!seen.has(childId)) queue.push({ id: childId, depth: depth + 1 })
     }
   }
   return tree
@@ -497,14 +475,14 @@ function collectTree(byId, rootId) {
  * an open conversation (including an unused "New Session" draft), while a
  * running job needs stopping first. Both make deleting the stored log unsafe.
  * @param ctx - Host context carrying the optional live registries.
- * @param tree - Sessions about to be deleted.
+ * @param sessionIds - Sessions about to be deleted.
  * @returns the live Session id and what holds it, or undefined when every one is cold.
  */
-function findLive(ctx, tree) {
+function findLive(ctx, sessionIds) {
   const agents = ctx.get('agents')
   const sessions = ctx.get('sessions')
   const jobs = ctx.get('jobs')
-  for (const { id } of tree) {
+  for (const id of sessionIds) {
     if (agents !== undefined && agents.get(id) !== undefined) return { sessionId: id, reason: 'agent' }
     if (sessions !== undefined && sessions.get(id) !== undefined) return { sessionId: id, reason: 'session' }
     if (jobs === undefined) continue
@@ -522,14 +500,14 @@ function findLive(ctx, tree) {
  * Delete every active reminder bound to the Sessions leaving the catalog, so a
  * later delivery cannot recreate a deleted Session log.
  * @param ctx - Host context; the schedule service is optional.
- * @param tree - Sessions being deleted.
+ * @param sessionIds - Sessions being deleted.
  * @returns the number of removed reminders.
  */
-async function deleteSchedules(ctx, tree) {
+async function deleteSchedules(ctx, sessionIds) {
   const schedule = ctx.get('schedule')
   if (schedule === undefined) return 0
   let removed = 0
-  for (const { id } of tree) {
+  for (const id of sessionIds) {
     let tasks
     try {
       tasks = await schedule.list({ sessionId: id })
@@ -552,10 +530,10 @@ async function deleteSchedules(ctx, tree) {
  * Remove the per-Session projection checkpoint files for the deleted ids. They
  * are a derived cache, so a failure here never turns a completed deletion into
  * an error; the cache service simply reads a missing record as absent.
- * @param tree - Sessions being deleted.
+ * @param sessionIds - Sessions being deleted.
  * @returns the number of removed cache files.
  */
-async function deleteProjectionCache(tree) {
+async function deleteProjectionCache(sessionIds) {
   const directory = join(dshHome(), 'storages', 'session_projcache', 'sessions')
   let entries
   try {
@@ -565,7 +543,7 @@ async function deleteProjectionCache(tree) {
   }
   let removed = 0
   for (const name of entries) {
-    for (const { id } of tree) {
+    for (const id of sessionIds) {
       if (name !== `${id}.json` && !name.startsWith(`${id}.json.bak.`)) continue
       try {
         await rm(join(directory, name), { force: true })
@@ -586,9 +564,8 @@ async function deleteProjectionCache(tree) {
  * profile that relocates the backend must set DSH_HOME or keep that layout.
  * @returns the absolute session root.
  */
-export function sessionsRoot() {
-  const configured = process.env.DSH_HOME?.trim()
-  return join(configured && configured !== '' ? configured : join(homedir(), '.dsh'), 'sessions')
+function sessionsRoot() {
+  return join(dshHome(), 'sessions')
 }
 
 /**
@@ -597,7 +574,7 @@ export function sessionsRoot() {
  * @param sessionId - safe stored Session id.
  * @returns the absolute Session directory, or undefined when absent.
  */
-export async function locateSessionDirectory(root, sessionId) {
+async function locateSessionDirectory(root, sessionId) {
   if (!SESSION_ID.test(sessionId)) return undefined
   let projects
   try {
@@ -608,13 +585,8 @@ export async function locateSessionDirectory(root, sessionId) {
   for (const project of projects) {
     if (!project.isDirectory() || project.isSymbolicLink()) continue
     const directory = join(root, project.name, sessionId)
-    let info
-    try {
-      info = await lstat(directory)
-    } catch {
-      continue
-    }
-    if (!info.isDirectory() || info.isSymbolicLink()) continue
+    const info = await statOrUndefined(directory)
+    if (info === undefined || !info.isDirectory() || info.isSymbolicLink()) continue
     return directory
   }
   return undefined
@@ -628,7 +600,7 @@ export async function locateSessionDirectory(root, sessionId) {
  * @param sessionId - safe stored Session id.
  * @returns whether a directory was found and removed.
  */
-export async function deleteSessionTree(root, sessionId) {
+async function deleteSessionTree(root, sessionId) {
   const directory = await locateSessionDirectory(root, sessionId)
   if (directory === undefined) return { found: false }
   assertContained(root, directory)

@@ -178,7 +178,7 @@ test('deletes an image only the deleted session referenced', async (t) => {
   const result = await deleteSession(ctx, 'session-a', { deleteAttachments: true })
 
   assert.equal(result.ok, true)
-  assert.deepEqual(result.attachments, { status: 'applied', requested: true, deleted: 1, kept: 0, failed: 0, missing: 0, bytes: 9 })
+  assert.deepEqual(result.attachments, { status: 'applied', deleted: 1, kept: 0, failed: 0, missing: 0, bytes: 9 })
   assert.equal(await exists(directory), false)
   assert.equal(await exists(imagePath), false)
 })

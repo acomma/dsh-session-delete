@@ -7,7 +7,7 @@ DSH 本身只提供「归档」，没有删除 API（`dsh-session-persistence-js
 ## 行为
 
 - 菜单项位于 `sidebar.workspaces.session.menu.item`，排在内置的归档和复制 ID 之后。
-- 行内图标与内置的「删除工作区」菜单项一致（`IconTrashOutlineRegular` 垃圾桶，14×14，错误色）；行的间距、内边距与悬停行为也对齐。
+- 菜单行与确认框直接复用内置 ui-primitives（`MenuItemButton`、`Modal`、`Button`、`IconTrashOutlineRegular`），图标、间距、悬停、焦点圈与内置归档/删除对话框一致。
 - 点击后弹出确认框，显示会话标题；确认后向 `POST api/session.delete` 发送请求。
 - 确认框里有一个**默认勾选**的「同时删除附件」选项。取消勾选则一律保留附件；保持勾选时，Host 先读取待删除会话日志中的附件引用（`attachmentId`），再逐个核对所有**保留下来**的会话日志：只有不再被任何保留会话引用的附件对象才会被删除，仍被引用的保留。
 - 引用核对通过 `sessionPersistence` 的逻辑事件流读取（只有这条读取路径能正确解码压缩日志）；核对有 30 秒预算，超时或任何一个保留会话读不出来时一律不删。
