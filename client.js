@@ -1,19 +1,18 @@
 /**
  * Browser half of the Session Delete bundle.
  *
- * Adds one destructive row to every Session's "..." menu and owns the
- * confirmation dialog. Both the menu row and the dialog live in slots owned by
- * the shipped Workspace browser and shell overlay; this module only projects
- * its own state into them. The row and dialog reuse the shipped ui-primitives
- * so they behave like the built-in archive and delete surfaces. Deletion itself
- * is the Host route `api/session.delete`, which applies the live-Session
- * refusal.
+ * Adds one destructive footer action after the built-in archive action in every
+ * Session's "..." menu and owns the confirmation dialog. The action is a
+ * `ctx.contextMenus` contribution; the dialog lives in the shell-overlay slot.
+ * The action icon and the dialog reuse the shipped ui-primitives so they behave
+ * like the built-in archive surface. Deletion itself is the Host route
+ * `api/session.delete`, which applies the live-Session refusal.
  */
 window.__ModuleLoader__.load({
   id: '@acomma/dsh-session-delete',
   factory(require) {
     const React = require('react')
-    const { Button, IconTrashOutlineRegular, MenuItemButton, Modal } = require('@deepseek-ai/dsh-client-ui-primitives')
+    const { Button, IconTrashOutlineRegular, Modal } = require('@deepseek-ai/dsh-client-ui-primitives')
     const h = React.createElement
 
     const NS = 'session-delete'
@@ -30,8 +29,10 @@ window.__ModuleLoader__.load({
       'dialog.attachmentsSummaryGone': '附件：要清理的附件对象已不存在。',
       'dialog.attachmentsSummaryNone': '附件：没有需要清理的附件。',
       'dialog.attachmentsSummaryKept': '{n} 个附件仍被其他会话引用，已保留。',
-      'dialog.attachmentsSummaryFailed': '{n} 个附件未能删除。',
-      'dialog.attachmentsUnverified': '未能核对其他会话的附件引用，所有附件均已保留。',
+      'dialog.attachmentsSummaryFailed': '{n} 个附件未能删除，仍留在磁盘上。',
+      'dialog.attachmentsUnverified': '未能核对全部会话目录或附件引用，所有附件均已保留。',
+      'dialog.spillFailed': '{n} 个会话的 spill 文件未能删除，仍留在磁盘上。',
+      'dialog.spillUnverified': '会话目录或 spill 引用核对不完整，spill 文件已保留。',
       'dialog.untitled': '未命名会话',
       'dialog.cancel': '取消',
       'dialog.confirm': '永久删除',
@@ -47,8 +48,13 @@ window.__ModuleLoader__.load({
       'error.invalid-request': '删除请求无效。',
       'error.directory-missing': '找不到该会话的存储目录，可能已被外部删除。',
       'error.delete-failed': '无法删除会话目录，可能有其他进程正在读取它。',
-      'error.partial': '部分文件未能删除；已删除的会话可能不完整，请稍后重试。',
+      'error.partial': '部分文件未能删除；根会话尚未删除，请稍后重试。',
       'error.unavailable': '会话存储服务不可用。',
+      'error.unsupported': '当前会话后端没有可解析的文件系统根目录，无法通过本插件删除。',
+      'error.ambiguous': '会话目录与 catalog 不一致，或同一 ID 存在多个目录；为避免删错，已拒绝删除。',
+      'error.scheduleFailed': '无法删除绑定在该会话上的提醒；会话文件没有改动。',
+      'error.liveCheckFailed': '无法确认会话是否仍在运行；为安全起见已拒绝删除。',
+      'error.timeout': '删除请求超时；请刷新页面确认实际结果。',
       'error.network': '无法连接到本地 Harness 服务。',
       'error.http': '删除请求失败（HTTP {status}）。',
     }
@@ -64,8 +70,10 @@ window.__ModuleLoader__.load({
       'dialog.attachmentsSummaryGone': 'Attachments: nothing was left to clean up on disk.',
       'dialog.attachmentsSummaryNone': 'Attachments: there was nothing to clean up.',
       'dialog.attachmentsSummaryKept': '{n} attachments are still referenced by other sessions and were kept.',
-      'dialog.attachmentsSummaryFailed': '{n} attachments could not be deleted.',
-      'dialog.attachmentsUnverified': 'Attachment references of other sessions could not be verified, so every attachment was kept.',
+      'dialog.attachmentsSummaryFailed': '{n} attachments could not be deleted and remain on disk.',
+      'dialog.attachmentsUnverified': 'Session directories or attachment references could not all be verified, so every attachment was kept.',
+      'dialog.spillFailed': '{n} session spill file groups could not be deleted and remain on disk.',
+      'dialog.spillUnverified': 'Session directories or spill references could not be fully verified, so spill files were kept.',
       'dialog.untitled': 'Untitled session',
       'dialog.cancel': 'Cancel',
       'dialog.confirm': 'Delete permanently',
@@ -81,8 +89,13 @@ window.__ModuleLoader__.load({
       'error.invalid-request': 'The delete request was invalid.',
       'error.directory-missing': 'The stored session directory could not be found; it may have been removed externally.',
       'error.delete-failed': 'The session directory could not be deleted; another process may be reading it.',
-      'error.partial': 'Some files could not be deleted; the session may be partially deleted. Try again later.',
+      'error.partial': 'Some files could not be deleted; the root session is still present, so retry after fixing access.',
       'error.unavailable': 'The session persistence service is unavailable.',
+      'error.unsupported': 'This session backend exposes no filesystem root, so this plugin cannot delete it.',
+      'error.ambiguous': 'The session directory does not match the catalog, or the id has multiple directories; deletion was refused to avoid removing the wrong data.',
+      'error.scheduleFailed': 'The reminders bound to this session could not be removed; no session files were changed.',
+      'error.liveCheckFailed': 'Liveness could not be determined, so deletion was refused.',
+      'error.timeout': 'The delete request timed out; refresh the page to confirm what happened.',
       'error.network': 'Could not reach the local Harness service.',
       'error.http': 'The delete request failed (HTTP {status}).',
     }
@@ -98,6 +111,8 @@ window.__ModuleLoader__.load({
       deleteAttachments: true,
       /** Attachment report of the last successful deletion, when one ran. */
       attachments: null,
+      /** Spill cleanup report of the last successful deletion, when one ran. */
+      spill: null,
     })
     /** One pending confirmation, shared by the menu row and the overlay dialog. */
     let state = CLOSED
@@ -146,6 +161,7 @@ window.__ModuleLoader__.load({
       const budget = deleteAttachments === true ? 180000 : 30000
       const timer = setTimeout(() => controller.abort(), budget)
       let response
+      let data = null
       try {
         response = await fetch(ROUTE, {
           method: 'POST',
@@ -153,16 +169,16 @@ window.__ModuleLoader__.load({
           body: JSON.stringify({ sessionId, deleteAttachments: deleteAttachments === true }),
           signal: controller.signal,
         })
+        try {
+          data = await response.json()
+        } catch {
+          /* an empty or non-JSON answer is reported through the status */
+        }
       } catch (error) {
+        if (controller.signal.aborted) return { ok: false, code: 'timeout', message: '' }
         return { ok: false, code: 'network', message: error instanceof Error ? error.message : String(error) }
       } finally {
         clearTimeout(timer)
-      }
-      let data = null
-      try {
-        data = await response.json()
-      } catch {
-        /* an empty or non-JSON answer is reported through the status */
       }
       if (response.ok && data?.ok === true) return { ok: true, data }
       return {
@@ -191,6 +207,16 @@ window.__ModuleLoader__.load({
           return t('error.partial')
         case 'unavailable':
           return t('error.unavailable')
+        case 'unsupported':
+          return t('error.unsupported')
+        case 'ambiguous':
+          return t('error.ambiguous')
+        case 'schedule-failed':
+          return t('error.scheduleFailed')
+        case 'live-check-failed':
+          return t('error.liveCheckFailed')
+        case 'timeout':
+          return t('error.timeout')
         case 'network':
           return t('error.network')
         default:
@@ -198,21 +224,6 @@ window.__ModuleLoader__.load({
             ? result.message
             : t('error.http', { status: String(result.status ?? 0) })
       }
-    }
-
-    /** One destructive row at the end of a Session's "..." menu. */
-    function DeleteSessionMenuItem(props) {
-      const { sessionId, displayTitle, useMenuOpenState, requestDelete: openDelete, t: translate } = props
-      const t = typeof translate === 'function' ? translate : (key) => key
-      const [, setMenuOpen] = useMenuOpenState()
-      return h(MenuItemButton, {
-        danger: true,
-        icon: h(IconTrashOutlineRegular, { size: 14 }),
-        onSelect: () => {
-          setMenuOpen(false)
-          openDelete(sessionId, displayTitle)
-        },
-      }, t('menu.delete'))
     }
 
     /** Byte count in the dialog's compact unit form. */
@@ -232,27 +243,49 @@ window.__ModuleLoader__.load({
     /**
      * One paragraph describing what the attachment cleanup did, or why it kept
      * everything. Only the Host can count references, so its report is the
-     * single source for these numbers.
+     * single source for these numbers. A `partial` report still lists what was
+     * kept and what failed instead of claiming there was nothing to clean up.
      * @param report - the `attachments` field of a successful deletion.
      * @param t - the dialog's translate seat.
      * @returns the summary element, or null when the cleanup did not run.
      */
     function attachmentSummary(report, t) {
       if (report === null || report === undefined) return null
-      if (report.status !== 'applied') {
+      if (report.status === 'unverified') {
         return h('p', { key: 'attachments', className: 'dsh-session-delete__warning' }, t('dialog.attachmentsUnverified'))
       }
       const parts = []
       if (report.deleted > 0) {
         parts.push(t('dialog.attachmentsSummaryDeleted', { n: String(report.deleted), size: formatBytes(report.bytes) }))
-      } else if (report.missing > 0) {
-        parts.push(t('dialog.attachmentsSummaryGone'))
-      } else {
-        parts.push(t('dialog.attachmentsSummaryNone'))
       }
-      if (report.kept > 0) parts.push(t('dialog.attachmentsSummaryKept', { n: String(report.kept) }))
-      if (report.failed > 0) parts.push(t('dialog.attachmentsSummaryFailed', { n: String(report.failed) }))
+      if (report.failed > 0) {
+        parts.push(t('dialog.attachmentsSummaryFailed', { n: String(report.failed) }))
+      }
+      if (report.kept > 0) {
+        parts.push(t('dialog.attachmentsSummaryKept', { n: String(report.kept) }))
+      }
+      if (parts.length === 0) {
+        parts.push(report.missing > 0 ? t('dialog.attachmentsSummaryGone') : t('dialog.attachmentsSummaryNone'))
+      }
       return h('p', { key: 'attachments', className: 'dsh-session-delete__body' }, parts.join(' '))
+    }
+
+    /**
+     * One warning for spill files that could not be removed. Spill cleanup is
+     * best effort; the session deletion itself has already succeeded.
+     * @param report - the `spill` field of a successful deletion.
+     * @param t - the dialog's translate seat.
+     * @returns the warning element, or null when nothing failed.
+     */
+    function spillSummary(report, t) {
+      if (report === null || report === undefined) return null
+      if (report.status === 'unverified' || report.status === 'unavailable') {
+        return h('p', { key: 'spill', className: 'dsh-session-delete__warning' }, t('dialog.spillUnverified'))
+      }
+      if (!(report.failed > 0)) return null
+      return h('p', { key: 'spill', className: 'dsh-session-delete__warning' }, t('dialog.spillFailed', {
+        n: String(report.failed),
+      }))
     }
 
     /** Frame-wide confirmation and success dialog, rendered by the shipped Modal. */
@@ -272,14 +305,19 @@ window.__ModuleLoader__.load({
         publish({ phase: 'deleting', error: null })
         const result = await postDelete(sessionId, deleteAttachments)
         if (result.ok) {
-          publish({ phase: 'success', error: null, attachments: result.data?.attachments ?? null })
+          publish({
+            phase: 'success',
+            error: null,
+            attachments: result.data?.attachments ?? null,
+            spill: result.data?.spill ?? null,
+          })
           return
         }
         publish({ phase: 'confirm', error: result })
       }
 
       const footer = success
-        ? h(Button, { key: 'close', variant: 'primary', autoFocus: true, onClick: dismiss }, t('dialog.close'))
+        ? h(Button, { key: 'close', variant: 'primary', 'data-modal-autofocus': true, onClick: dismiss }, t('dialog.close'))
         : h(React.Fragment, null,
             h(Button, {
               key: 'cancel',
@@ -314,8 +352,9 @@ window.__ModuleLoader__.load({
         h('span', { className: 'dsh-session-delete__optionHint' }, t('dialog.attachmentsHint'))))
 
       const summary = success ? attachmentSummary(current.attachments, t) : null
+      const spillWarning = success ? spillSummary(current.spill, t) : null
       const body = success
-        ? (summary === null ? [] : [summary])
+        ? [summary, spillWarning].filter((item) => item !== null)
         : [
             h('p', { key: 'warning', className: 'dsh-session-delete__warning' }, t('dialog.warning')),
             option,
@@ -390,7 +429,7 @@ window.__ModuleLoader__.load({
 }
 `
 
-    const inject = ['slots', 'locale']
+    const inject = ['slots', 'locale', 'contextMenus']
 
     function apply(ctx) {
       ctx.effect(() => {
@@ -403,13 +442,28 @@ window.__ModuleLoader__.load({
 
       ctx.effect(() => ctx.locale.register(NS, { en, zh }), 'session-delete: dictionaries')
 
-      ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
-        name: 'sidebar.workspaces.session.menu.item',
+      // The built-in archive action is a footer (afterContent) contribution at
+      // order 600; order 700 with afterContent places this directly after it.
+      const t = ctx.locale.bind(NS)
+      ctx.slots.inject('contextMenu.icon', () => ctx.slots.register({
+        name: 'contextMenu.icon',
+        key: 'session-delete.trash',
+      }, IconTrashOutlineRegular))
+
+      ctx.effect(() => ctx.contextMenus.register({
         id: 'session-delete.menu',
-        order: 500,
-        locale: NS,
-        inject: () => ({ requestDelete }),
-      }, DeleteSessionMenuItem))
+        target: 'session',
+        order: 700,
+        observe: () => [ctx.locale],
+        resolve: ({ sessionId, displayTitle }) => [{
+          id: 'delete',
+          label: t('menu.delete'),
+          icon: { key: 'session-delete.trash' },
+          danger: true,
+          afterContent: true,
+          run: () => requestDelete(sessionId, displayTitle),
+        }],
+      }), 'session-delete: session menu action')
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay',
