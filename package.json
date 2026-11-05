@@ -1,11 +1,11 @@
 {
   "name": "@local/dsh-session-delete",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Delete a stored DSH session permanently from the session row menu, reclaiming attachments only that session referenced (on by default)",
+  "description": "Delete a stored DSH session permanently from the session row menu, and optionally delete every session of a workspace from the Workspace delete dialog, reclaiming attachments only the removed sessions referenced",
   "scripts": {
-    "test": "node --test test/session-delete.test.mjs"
+    "test": "node test/all.test.mjs"
   },
   "exports": {
     ".": "./index.js",
@@ -31,7 +31,8 @@
       "inject": [
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-renderer",
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-api-workspace-controller"
       ]
     }
   }

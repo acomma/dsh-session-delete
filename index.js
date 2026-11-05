@@ -3,10 +3,12 @@
  *
  * DSH archives Sessions but deliberately ships no deletion API: the persistence
  * seam stores one log per Session and documents that "nothing deletes session
- * files". This plugin adds exactly one narrow operation, reachable from the
- * Session row menu in the Web UI through an authenticated Fetch route. It
- * refuses a live Session, and deletes a cold Session's stored log together
- * with the logs of its subagent descendants.
+ * files". This plugin adds two narrow operations, both reachable through
+ * authenticated Fetch routes and both refusing live work:
+ *
+ * - delete one stored Session log together with its subagent descendants;
+ * - purge every deletable Session a Workspace owns, so the shipped "delete
+ *   workspace" action can offer to take the logs with the registration.
  *
  * The session log directory is the only authoritative Session artifact. Derived
  * caches and shared attachment blobs live elsewhere. On request the caller may
@@ -20,8 +22,12 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 /** Absolute Fetch path; the browser calls the document-relative `api/session.delete`. */
 const ROUTE = '/api/session.delete'
+/** Absolute Fetch path of the workspace cascade; the browser calls the document-relative form. */
+const WORKSPACE_ROUTE = '/api/workspace.purge-sessions'
 /** Safe stored-session id: one path segment, no traversal, no separators. */
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+/** Safe workspace registration id: the UUID shape the Workspace registry mints. */
+const WORKSPACE_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 /** Guards a pathological lineage against an unbounded walk. */
 const MAX_TREE_DEPTH = 64
 /** Durable attachment identity: the content addresses recorded in a Session log. */
@@ -41,12 +47,20 @@ const FAILURE_MESSAGES = {
   'delete-failed': 'The session directory could not be deleted.',
   partial: 'Some session files could not be deleted; see the deleted and failed lists.',
   'list-failed': 'The stored session list could not be read.',
+  'workspace-invalid-request': 'Expected a JSON body with a workspaceId string and deleteSessions: true.',
+  'workspace-invalid-id': 'The workspace id is not a registry workspace id.',
+  'workspace-unavailable': 'The Workspace registry is not mounted in this profile.',
+  'workspace-not-found': 'No Workspace registration has that id.',
 }
 
 /**
- * Register the authenticated deletion route when the Web carrier and Session
+ * Register the authenticated deletion routes when the Web carrier and Session
  * persistence are both available. An injection (rather than a hard `inject`)
  * keeps the bundle inactive in profiles without a browser carrier.
+ *
+ * The workspace route is registered defensively: the single-Session route is
+ * this bundle's original contract, so a carrier that refuses the second
+ * registration loses the cascade and keeps the Session row menu working.
  * @param ctx - the composed Host context.
  */
 export function apply(ctx) {
@@ -60,7 +74,36 @@ export function apply(ctx) {
       }),
       'session-delete: authenticated deletion route',
     )
+    scope.effect(
+      () => {
+        try {
+          return scope.connection.fetch.register({
+            path: WORKSPACE_ROUTE,
+            methods: ['POST'],
+            requestBody: 'buffered',
+            fetch: (request) => respondWorkspace(scope, request),
+          })
+        } catch (error) {
+          scope.logger?.warn?.(`session-delete: workspace purge route unavailable: ${String(error)}`)
+          return () => {}
+        }
+      },
+      'session-delete: authenticated workspace purge route',
+    )
   })
+}
+
+/**
+ * Read one request body, reporting an unparseable one as undefined.
+ * @param request - the authenticated Fetch request.
+ * @returns the parsed JSON body, or undefined when it is not JSON.
+ */
+async function readJson(request) {
+  try {
+    return await request.json()
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -70,13 +113,30 @@ export function apply(ctx) {
  * @returns the HTTP response.
  */
 async function respond(ctx, request) {
-  let body
-  try {
-    body = await request.json()
-  } catch {
+  const body = await readJson(request)
+  if (body === undefined) {
     return json({ ok: false, code: 'invalid-request', message: FAILURE_MESSAGES['invalid-request'] }, 400)
   }
   const result = await deleteSession(ctx, body?.sessionId, { deleteAttachments: body?.deleteAttachments === true })
+  return json(result, statusFor(result))
+}
+
+/**
+ * Read one workspace cascade request and answer with its JSON result.
+ *
+ * The body must also carry `deleteSessions: true`: without it the built-in
+ * workspace delete already does exactly what the caller wants, and a route that
+ * silently deleted logs anyway would be a footgun.
+ * @param ctx - Host context carrying the Workspace registry and persistence.
+ * @param request - the authenticated Fetch request.
+ * @returns the HTTP response.
+ */
+async function respondWorkspace(ctx, request) {
+  const body = await readJson(request)
+  if (body === undefined || body?.deleteSessions !== true) {
+    return json({ ok: false, code: 'workspace-invalid-request', message: FAILURE_MESSAGES['workspace-invalid-request'] }, 400)
+  }
+  const result = await purgeWorkspaceSessions(ctx, body?.workspaceId, { deleteAttachments: body?.deleteAttachments === true })
   return json(result, statusFor(result))
 }
 
@@ -172,6 +232,150 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
     result.failed = failed
   }
   return result
+}
+
+/**
+ * Permanently delete every deletable Session a Workspace owns.
+ *
+ * The Workspace registration is deliberately left alone: this route only
+ * reclaims the Session logs the caller asked to remove with it, so the shipped
+ * "delete workspace" action keeps owning the registry write and the client can
+ * fall back to it unchanged. Sessions are selected from the registry record's
+ * `sessionIds` (the same account the sidebar groups), each expanded to the
+ * subagent tree it owns, and a tree is skipped as a whole when anything in it
+ * is live: an Agent, an in-memory Session, or a running job still holds the log,
+ * and the workspace row can leave while that conversation keeps running.
+ * A Session the catalog no longer lists is still attempted by directory, because
+ * a stale Workspace record can outlive logs the catalog stopped indexing.
+ * @param ctx - Host context carrying the Workspace registry and persistence.
+ * @param rawWorkspaceId - requested Workspace registration id.
+ * @param options - optional attachment cleanup; it runs only for `deleteAttachments: true`.
+ * @returns a structured result; `ok` is false only when a Session delete failed.
+ */
+export async function purgeWorkspaceSessions(ctx, rawWorkspaceId, options = {}) {
+  const deleteAttachments = options?.deleteAttachments === true
+  const workspaceId = typeof rawWorkspaceId === 'string' ? rawWorkspaceId.trim() : ''
+  if (!WORKSPACE_ID.test(workspaceId)) return failure('workspace-invalid-id')
+
+  const registry = ctx.get('workspaceRegistry')
+  if (registry === undefined) return failure('workspace-unavailable')
+  const persistence = ctx.get('sessionPersistence')
+  if (persistence === undefined) return failure('unavailable')
+
+  let workspace
+  try {
+    workspace = registry.get(workspaceId)
+  } catch (error) {
+    return failure('workspace-unavailable', undefined, describe(error))
+  }
+  if (workspace === undefined) return failure('workspace-not-found')
+
+  let snapshots
+  try {
+    snapshots = await persistence.list()
+  } catch (error) {
+    return failure('list-failed', undefined, describe(error))
+  }
+  const byId = new Map()
+  for (const snapshot of snapshots) byId.set(String(snapshot.header.id), snapshot)
+
+  const recordIds = Array.isArray(workspace.sessionIds) ? workspace.sessionIds : []
+  const roots = [...new Set(recordIds.map((rawId) => String(rawId)).filter((id) => SESSION_ID.test(id)))]
+
+  // Expand each root's owned subagent tree once; a tree shares its root's fate.
+  const trees = new Map()
+  const everyId = new Set()
+  for (const root of roots) {
+    const ids = byId.has(root) ? collectTree(byId, root) : [root]
+    trees.set(root, ids)
+    for (const id of ids) everyId.add(id)
+  }
+
+  const targets = []
+  const skipped = []
+  for (const root of roots) {
+    const live = findLive(ctx, trees.get(root))
+    if (live === undefined) targets.push(root)
+    else skipped.push({ sessionId: root, reason: live.reason, liveSessionId: live.sessionId })
+  }
+
+  const deletable = new Set()
+  for (const root of targets) for (const id of trees.get(root)) deletable.add(id)
+
+  // Read what the doomed Sessions reference while their logs still exist.
+  const owned = deleteAttachments ? await readAttachmentRefs(persistence, [...deletable]) : undefined
+
+  const root = sessionsRoot()
+  const deleted = []
+  const missing = []
+  const failed = []
+  for (const id of deletable) {
+    try {
+      const outcome = await deleteSessionTree(root, id)
+      if (!outcome.found) {
+        missing.push({ sessionId: id })
+        continue
+      }
+      deleted.push(id)
+    } catch (error) {
+      failed.push({ sessionId: id, code: 'delete-failed', message: describe(error) })
+    }
+  }
+
+  const deletedSet = new Set(deleted)
+  const rootSet = new Set(roots)
+  const rootsDeleted = targets.filter((id) => trees.get(id).every((child) => deletedSet.has(child)))
+  const sessions = {
+    total: roots.length,
+    deleted,
+    rootsDeleted,
+    skipped,
+    missing,
+    failed,
+    descendantsDeleted: deleted.filter((id) => !rootSet.has(id)).length,
+  }
+
+  if (deleted.length === 0 && failed.length > 0) {
+    return { ...failure('delete-failed'), workspaceId, sessions }
+  }
+
+  const schedules = await deleteSchedules(ctx, deleted)
+  const caches = await deleteProjectionCache(deleted)
+  // The skipped trees are passed in `tree` but not in `deleted`: their logs are
+  // still a reference source, so any object they share with a removed Session is kept.
+  const attachments = owned === undefined
+    ? undefined
+    : await settleAttachments(persistence, [...everyId], deleted, owned)
+
+  // Announce the removals so a connected page drops the rows immediately.
+  for (const id of deleted) {
+    try {
+      ctx.emit('api-session/removed', id)
+    } catch {
+      /* observation only */
+    }
+  }
+
+  if (failed.length > 0) {
+    return {
+      ...failure('partial'),
+      workspaceId,
+      sessions,
+      schedules,
+      caches,
+      ...(attachments === undefined ? {} : { attachments }),
+    }
+  }
+
+  return {
+    ok: true,
+    workspaceId,
+    workspace: { title: String(workspace.title), path: String(workspace.path) },
+    sessions,
+    schedules,
+    caches,
+    ...(attachments === undefined ? {} : { attachments }),
+  }
 }
 
 /**
@@ -661,8 +865,11 @@ function statusFor(result) {
   switch (result.code) {
     case 'invalid-request':
     case 'invalid-id':
+    case 'workspace-invalid-request':
+    case 'workspace-invalid-id':
       return 400
     case 'not-found':
+    case 'workspace-not-found':
       return 404
     case 'live':
     case 'directory-missing':
