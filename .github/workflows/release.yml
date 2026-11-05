@@ -23,7 +23,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm test
       - run: npm pack --dry-run
-      - run: npm publish --provenance --access public
+      - run: npm stage publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: npm pack

@@ -77,9 +77,9 @@ npm view @acomma/dsh-session-delete dist.tarball
 
 CI 使用 GitHub Actions 的 OIDC provenance，不需要在本机保存 npm token。仓库需要配置：
 
-- Secret `NPM_TOKEN`：npm granular access token，至少拥有 `@acomma` scope 的 publish 权限。
+- Secret `NPM_TOKEN`：npm granular access token，拥有 `@acomma` scope 的写权限；不需要 2FA bypass。
 - 仓库是公开的（provenance 需要）。
-- workflow 已有 `id-token: write` 权限。
+- workflow 已有 `id-token: write` 和 `contents: write` 权限。
 
 流程：
 
@@ -91,14 +91,28 @@ git push origin v1.0.1
 `.github/workflows/release.yml` 会在 tag 上跑测试并执行：
 
 ```text
-npm publish --provenance --access public
+npm stage publish --provenance --access public
 ```
 
-发布后验证签名：
+这会把版本放进 npm 的 staged 区，同时创建 GitHub Release 并附上 tarball。**npm 不会立即公开**，需要维护者在本机批准（会要求 2FA）：
 
 ```powershell
+npm login
+npm stage list @acomma/dsh-session-delete
+npm stage view <stage-id>          # 可选，先检查版本和内容
+npm stage approve <stage-id>
+```
+
+批准后验证：
+
+```powershell
+npm view @acomma/dsh-session-delete version
 npm audit signatures
 ```
+
+不想发布时用 `npm stage reject <stage-id>` 丢弃这次 stage。
+
+> 账号或包启用 staged publishing 时，CI 里的 `npm publish` 也可能把版本 stage 住，但命令本身不会明确说明。直接使用 `npm stage publish` 更清楚，也符合 npm 推荐的新包发布流程。
 
 ### 预发布
 
