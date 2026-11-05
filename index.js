@@ -152,11 +152,7 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
   const attachments = owned === undefined ? undefined : await settleAttachments(ctx, tree, deleted, owned)
 
   // Announce that these Sessions left the catalog so a connected page drops
-  // their rows immediately. The page then opens a neighbouring Session, and
-  // merely following one makes the Host resume an Agent for it
-  // (SessionController.promote), so that neighbour becomes live and cannot be
-  // deleted until the process restarts. Immediate row removal is the chosen
-  // trade-off: the alternative keeps stale rows that Desktop cannot refresh.
+  // their rows immediately instead of keeping stale rows until a reload.
   for (const id of deleted) {
     try {
       ctx.emit('api-session/removed', id)
