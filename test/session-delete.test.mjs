@@ -39,7 +39,7 @@ async function addSessionDirectory(home, id, project = '--work--') {
 }
 
 function snapshot(id) {
-  return { header: { id, version: 3, createdAt: 1, cwd: 'C:/work' }, revision: `rev-${id}`, sizeBytes: 16 }
+  return { header: { id, version: 3, createdAt: 1, cwd: '/work' }, revision: `rev-${id}`, sizeBytes: 16 }
 }
 
 function imageEvent(seq, digest) {

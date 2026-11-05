@@ -1,10 +1,28 @@
 {
-  "name": "@local/dsh-session-delete",
+  "name": "@acomma/dsh-session-delete",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "description": "Delete a stored DSH session permanently from the session row menu, reclaiming attachments only that session referenced (on by default)",
   "icon": "./icon.svg",
+  "license": "MIT",
+  "author": "acomma (https://github.com/acomma)",
+  "homepage": "https://github.com/acomma/dsh-session-delete#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/acomma/dsh-session-delete.git"
+  },
+  "bugs": {
+    "url": "https://github.com/acomma/dsh-session-delete/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "session",
+    "delete"
+  ],
+  "main": "index.js",
   "scripts": {
     "test": "node --test test/session-delete.test.mjs"
   },
@@ -21,8 +39,16 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

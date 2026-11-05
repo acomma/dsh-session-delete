@@ -1,6 +1,7 @@
 node_modules/
 *.log
 npm-debug.log*
+*.tgz
 .DS_Store
 Thumbs.db
 .idea/

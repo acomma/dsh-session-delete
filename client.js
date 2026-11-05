@@ -10,7 +10,7 @@
  * refusal.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-session-delete',
+  id: '@acomma/dsh-session-delete',
   factory(require) {
     const React = require('react')
     const { Button, IconTrashOutlineRegular, MenuItemButton, Modal } = require('@deepseek-ai/dsh-client-ui-primitives')
