@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Delete a stored DSH session permanently from the session row menu, reclaiming attachments only that session referenced (on by default)",
+  "icon": "./icon.svg",
   "scripts": {
     "test": "node --test test/session-delete.test.mjs"
   },
@@ -11,7 +12,8 @@
     ".": "./index.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.js",
