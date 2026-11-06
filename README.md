@@ -89,18 +89,19 @@ dsh plugin --profile desktop add @acomma/dsh-session-delete@1.0.1
 - 点击后弹出确认框，显示会话标题；确认后向 `POST api/session.delete` 发送请求。
 - 会话 ID 按存储值**原样使用**，不 `trim`、不改大小写；文件系统目录通过与 JSONL 后端相同的 `encodeSegment` 规则构造，所以空格、中文、分隔符等合法 ID 都能定位。投影缓存只清理 storage-json 接受的 `[A-Za-z0-9_-]+` key。
 - 确认框里有一个**默认勾选**的「同时删除附件」选项。取消勾选则一律保留附件；保持勾选时，Host 先读取待删除会话日志中的附件引用（`attachmentId`），再逐个核对所有**保留下来**的会话日志：只有不再被任何保留会话引用的附件对象才会被删除，仍被引用的保留。
+- 删除前先做一次**树完整性预检**：在根会话所在 project 下，如果存在 catalog 无法命名的会话目录，存在 `origin: 'subagent'` 但 `parentSession` 不在 catalog 中的会话，或某个 subagent 的父链落在目标树内却没有被纳入删除树（例如中间会话缺少 `origin`），返回 `tree-incomplete` 并拒绝删除。否则 `list()` 跳过读不了 header 的子会话时，删除根会留下一个不能再单独删除（`subagent-session`）的孤儿子会话。
 - 核对前还会把会话根目录下的会话目录与删除后的 `sessionPersistence.list()` 对一遍：出现 catalog 无法命名的会话目录（包括只有子目录、没有文件的目录），或同一个 id 落在两个项目目录下时，一律不做附件清理（`attachments.status = "unverified"`，`reason = "catalog"`），因为无法证明这些会话不引用目标对象。`list()` 会跳过当前 Build 读不了 header 的会话，这类目录正是靠这一步兜住。
-- 删除目录前会为每个 id 解析目标目录：优先使用 snapshot 的 `location.path` 父目录（这是后端的权威路径）；没有 location 时才扫描项目目录。同一 id 出现多个目录，或扫描目录与 catalog location 不一致时，返回 `ambiguous` 并拒绝删除，不会只挑第一个。
-- 引用核对通过 `sessionPersistence` 的逻辑事件流读取（只有这条读取路径能正确解码压缩日志）；「读取待删会话 + 核对保留会话」共享 30 秒预算，超时或任何一个会话读不出来时一律不删。如果某个幸存的 live 会话日志仍处于 pending（尚未 materialize），其内存引用无法读取，附件清理同样保留全部对象；backend 没有 JSONL 实现的 `hasPendingSession()` 时，会退回公开的 `stat()` 快照（没有 `location` 即 pending），探测失败也按未知处理。
-- 对**仍存活**的保留会话，除了持久化日志，还会合并其 `snapshotEvents()` 内存快照，避免漏掉 write-behind 缓冲中刚发布、尚未落盘的附件引用。
+- 删除目录前会为每个 id 解析目标目录：优先使用 snapshot 的 `location.path` 父目录（这是后端的权威路径）；没有 location 时才扫描项目目录。同一 id 出现多个目录，或扫描目录与 catalog location 不一致时，返回 `ambiguous` 并拒绝删除，不会只挑第一个。多个 location 造成的目标树重复 id 由上面的预检发现。
+- 引用核对通过 `sessionPersistence` 的逻辑事件流读取（只有这条读取路径能正确解码压缩日志）；「读取待删会话 + 核对保留会话」共享 30 秒预算，超时或任何一个会话读不出来时一律不删。如果某个幸存的 live 会话日志仍处于 pending（尚未 materialize），其内存引用无法读取，附件清理同样保留全部对象；backend 没有 JSONL 实现的 `hasPendingSession()` 时，会退回公开的 `stat()` 快照（没有 `location` 即 pending），探测失败也按未知处理。附件根不可用时不再扫描待删日志，直接返回 `attachments.status = "unverified"`。
+- 对**仍存活**的保留会话，除了持久化日志，还会合并其 `snapshotEvents()` 内存快照，避免漏掉 write-behind 缓冲中刚发布、尚未落盘的附件引用。对不在本进程 live、但已 materialize 的 current 幸存会话，读取日志前先做一次 write-lease 探测；另一个进程仍在写时保留全部附件（`reason = "writer"`）。
 - 附件对象按 `objects`、`file-objects`、`files` 三个位置删除；每次清理还会移除 `attachments/v1/tmp` 中超过 7 天的暂存残留（窗口刻意放宽，因为通用文件没有大小上限，慢速大文件上传可能持续很久），数量记在 `attachments.staging` 并在成功摘要中显示。部分对象删不掉时返回 `attachments.status = "partial"` 与 `failed` 计数，对象留在磁盘上。`tmp` 和 projection-cache 目录同样做 `realpath`/符号链接检查。
-- Host 侧先检查会话是否仍然存活：Agent 注册表、Session 内存存储、运行中的后台任务任一命中都会拒绝删除。后台任务只按 `owner === sessionId` 计入（与 DSH 归档准入一致，未归属任务不阻止删除）。拒绝结果带 `reason`：`agent`（会话已被 Host 激活）、`session`（会话仍在内存中）、`job`（有运行中的后台任务）；客户端保留该 `reason`，因此 job 场景显示“先停止后台任务”而不是“重启 Harness”。查询失败会返回 `live-check-failed`，不会当作「没有任务」继续。
+- Host 侧先检查会话是否仍然存活：Agent 注册表、Session 内存存储、运行中的后台任务任一命中都会拒绝删除；此外会扫描所有 live Agent/Session 的 subagent 祖先链，覆盖未进入 catalog 的 pending 子会话，对已 materialize 的 tree 会话做一次 `open(id, 'write')` 短探测，并在清除 reminder 后询问 DSH 的 `workspace/session-activity` waterfall 以覆盖自定义 activity provider。后台任务只按 `owner === sessionId` 计入（与 DSH 归档准入一致，未归属任务不阻止删除）。拒绝结果带 `reason`：`agent`、`session`、`job`、`writer`，以及 waterfall 报告的 activity kind；客户端保留该 `reason`，因此 job 场景显示“先停止后台任务”而不是“重启 Harness”。查询失败会返回 `live-check-failed`，不会当作「没有任务」继续。
 - 删除前会先移除目标树上的 schedule 提醒，再检查一次 live，然后才动日志。这样 reminder 不会在删除过程中激活会话；reminder 删除失败时返回 `schedule-failed`，日志保持不动。如果提醒已经删了一部分、后续 live 检查或目录删除才失败，结果会带 `schedules` 计数，客户端会明确提示“提醒已移除、不会恢复”。
-- 只删除**冷会话**：删除会话根目录下的 `<项目>/<encodedSessionId>/` 整个日志目录；如果该会话有 `origin: 'subagent'` 的子会话，一并删除，其中任何一个仍然 live 都会阻止删除；fork 出来的会话是独立谱系，不会被连带删除。直接把一个 `origin: 'subagent'` 的子会话作为根 id 调用 API 会被拒绝（`subagent-session`），避免父 Session 的 subagent catalog 留下不可修复的悬空引用。子目录先删、根目录最后删：子目录失败时根目录保留，重试仍可继续；已经缺失的子目录按已删除处理。
+- 只删除**冷会话**：删除会话根目录下的 `<项目>/<encodedSessionId>/` 整个日志目录；如果该会话有 `origin: 'subagent'` 的子会话，一并删除，其中任何一个仍然 live 都会阻止删除；fork 出来的会话是独立谱系，不会被连带删除。直接把一个 `origin: 'subagent'` 的子会话作为根 id 调用 API 会被拒绝（`subagent-session`），避免父 Session 的 subagent catalog 留下不可修复的悬空引用。子目录按深度优先删除、根目录最后删；**任一子目录删除失败后立即停止**，不会继续删除它的祖先，因此重试仍能沿父链到达失败节点。已经缺失的子目录按已删除处理。
 - 删除绑定在该会话上的提醒（schedule）：只支持 0.2.2-rc.1 起的 `target` + `edit({ action: 'delete' })` API；`new_once` 预留目标也会处理，`new` 目标保留。无关的旧模型记录会被忽略；只有旧记录确实指向待删会话时才拒绝。
-- 删除该会话的 `session_projcache/sessions/<safeId>.json` 派生缓存（以及 `.json.bak.*` 备份）；无法确认 storage 根目录布局时不做删除。
-- 删除该会话的本地 spill 目录 `<spillRoot>/session-<sha256(id)[0:12]>/`。默认 spill root 是进程级临时目录，因此还会检查同一个临时目录下其他 `dsh-spill-*` root 中的同名会话目录；配置了稳定 root 时只清理该 root。存在仍可能从该树派生的 fork/subagent 时保留，避免破坏继承的 locator。远程 spill 后端不暴露 root 时交给其自身保留策略。
-- 菜单 action 会通过 `ctx.remoteAccess.source('session', id, 'session/delete')` 门控；owner 总是可见，非 owner 没有对应 grant 时不显示，避免点击后才收到 403。
+- 删除该会话的 `session_projcache/sessions/<safeId>.json` 派生缓存（以及 `.json.bak.*` 备份）。根目录优先取已挂载 `storage` hub 的 JSON backend `root`；无法确认根目录时跳过这项清理，不猜 `<DSH_HOME>/storages`。
+- 删除该会话的本地 spill 目录 `<spillRoot>/session-<sha256(id)[0:12]>/`。默认 spill root 是进程级临时目录，因此还会检查同一个临时目录下其他**严格匹配 `dsh-spill-` 加 6 位字母数字**的 root 中的同名会话目录，并在 POSIX 上检查 root/祖先的所有权和权限；配置了稳定 root 时只清理该 root。存在仍可能从该树派生的 fork/subagent，或幸存 subagent 的父链无法解析时保留，避免破坏继承的 locator。远程 spill 后端不暴露 root 时交给其自身保留策略。
+- 菜单 action 会通过 `ctx.remoteAccess.source('session', id, 'session/delete')` 门控；由于 exact route 只允许 owner，`session/delete` 也不是可授予的 Remote endpoint，非 owner 实际上始终看不到这一项。
 - Client 字典覆盖 DSH 内置的 `zh` / `en`；如果 profile 额外安装了其他语言包，未覆盖的语言回退英文。
 - 成功后向已连接的页面发出 `api-session/removed`，侧边栏行立刻消失（不依赖刷新页面）。
 
@@ -111,15 +112,18 @@ dsh plugin --profile desktop add @acomma/dsh-session-delete@1.0.1
 - **删除失败的对象**：已经删掉的会话无法再提供它的引用，插件也没有第二次核对的入口；`failed` 计数里的对象会留在磁盘上，需要时按上面的路径规则手动清理。
 - **写失败的暂存文件**：`attachments/v1/tmp` 里 7 天内的文件保留，只有在执行清理时才会顺带删除更早的残留。
 - **有幸存后代的 spill**：如果删除的树仍有 subagent 后代，或任何仍存活的会话带 `isSeeded`（当前 DSH 普通 fork 只写 `isSeeded`、不写 `parentSession`），spill 目录整体保留，避免破坏后代继承的 locator；没有可疑幸存者时才删除。非本地 spill 后端、或日志快照之外被外部引用的 locator 不在核对范围内。
-- **工作区成员记录**：`storages/workspace.json` 里的 `sessionIds` 由 Workspace registry 维护，它会在下次启动/下一次工作区变更时按「会话头是否存在」自行清理；本插件不直接改这个存储文件，避免与内存态不一致。`archivedSessionIds` / `pinnedSessionIds` 不会随 header 刷新自动清理，插件在删除成功后会通过公开的 `unarchiveSession` / `unpinSession` 尽力清除；失败只留下派生状态。
-- **`storages/session_projcache.json` 中的旧记录**：派生缓存，不是会话数据源；本插件不清理这里的旧记录。
-- **自定义 storage 根**：projection cache 固定按随附组合的 `<DSH_HOME>/storages/session_projcache/sessions` 清理；如果 profile 把 storage-json 根改到别处，缓存会保留。
+- **工作区成员记录**：删除成功后，插件通过公开的 `Workspace.detachSession` 从每个包含该 id 的 workspace 移除成员记录；`archivedSessionIds` / `pinnedSessionIds` 则通过公开的 `unarchiveSession` / `unpinSession` 清除。任一步失败只留下派生状态，不影响已完成的会话删除。插件不直接改 `storages/workspace.json`。
+- **Workspace 内存 header 索引**：`WorkspaceRegistry.sessionPaths` 仍是 registry 持有的内存索引，外部删除日志后不会立即刷新；`detachSession` 只清 durable account，没有公开 API 清该 map。同 ID 在 registry 重新索引前重建的极端场景仍可能读到旧 cwd。
+- **`snapshotEvents` 弃用 API**：存活会话的内存 write-behind 引用仍通过 DSH 已标记 deprecated 的 `Session.snapshotEvents()` 读取；当前没有等价的公开替代。
+- **activity waterfall 的范围**：`workspace/session-activity` 只按目标树中的 id 查询；未进入 tree 的孤儿后代如果只由自定义 provider 报告活动，插件无法枚举该 id。本地 live Agent/Session 已由祖先链覆盖。
+- **`storages/session_projcache.json` 中的旧记录**：legacy whole-unit 文件中的旧记录不会清理；当前 per-record `sessions/` 目录存在时 DSH 也不会重新 bootstrap 它。派生缓存，不是会话数据源。
+- **自定义 storage 根**：projection cache 的根取自已挂载 `storage` hub 的 JSON backend；如果该 backend 不暴露可确认的 root，插件跳过 cache 清理，而不是按 `<DSH_HOME>/storages` 猜测。
 
 ## 安全边界
 
 - 路由注册在 `connection.fetch` 的 `/api` 通道上，只有通过 Host/Origin 校验和浏览器会话认证的请求才能到达；exact route 只允许 owner peer。
-- 会话 ID 必须是字符串，但不再限制字符集；它只通过 `encodeSegment` 进入路径。删除前再次确认目标恰好是 `<root>/<项目>/<encodedId>` 两级目录，且不是符号链接；同一 id 多目录或与 catalog location 不符时拒绝。
-- 附件对象路径只由 `sha256:<64 位小写十六进制>` 摘要拼出；删除前用 `realpath` 确认父目录和 leaf 本身仍在附件根目录内，并限定在 `objects`、`file-objects`、`files` 三个子目录；符号链接和类型不符的条目拒绝删除并计入 `failed`。`tmp`、projection cache 和 spill 目录也做符号链接/包含检查，并在删除时使用已解析路径。
+- 会话 ID 必须是字符串，但不再限制字符集；它只通过 `encodeSegment` 进入路径。删除前再次确认目标恰好是 `<root>/<项目>/<encodedId>` 两级目录，且不是符号链接；同一 id 多目录或与 catalog location 不符时拒绝。删除目标必须是 root 的严格后代，且 realpath 后 basename 仍等于计划目录名，防止 mount/reparse 目标把一次删除重定向到容器根或另一个会话目录。
+- 附件对象路径只由 `sha256:<64 位小写十六进制>` 摘要拼出；删除前用 `realpath` 确认父目录和 leaf 本身仍在附件根目录内，并限定在 `objects`、`file-objects`、`files` 三个子目录的精确 digest 路径；符号链接和类型不符的条目拒绝删除并计入 `failed`。`tmp`、projection cache 和 spill 目录也做精确父目录/符号链接/包含检查，并在删除时使用已解析路径。
 - 只有服务暴露已解析的文件系统根目录时才执行删除；没有 `root` 的非 JSONL/非本地后端返回 `unsupported`，不会退回默认目录误删。
 - 附件清理是「宁可保留」策略：核对不完整（日志读不出来、超时、会话目录与 catalog 对不上、附件根不可用、存在待确认的 pending/存活快照）时保留全部附件并返回 `attachments.status = "unverified"`，但会话删除本身仍然成功。
 - 本地单用户环境下仍有 `realpath` 校验与 `rm` 之间的父目录交换窗口；插件已改为尽量删除解析后的路径，并拒绝链接/类型不符的条目，但无法在 Node 的路径 API 上做到完全 fd-relative 的原子性。能写 DSH_HOME 的本地攻击者本身已具备直接删除能力。
@@ -127,7 +131,7 @@ dsh plugin --profile desktop add @acomma/dsh-session-delete@1.0.1
 
 ## 存储位置
 
-会话根目录取 `sessionPersistence` 的解析结果：JSONL 后端暴露已解析的 `root`（profile 重定位后端时它仍是准确的），没有 `root` 时再取它的 `config.root`；两者都没有时插件返回 `unsupported`，不退回到某个默认目录。附件仓库取已挂载的 `attachments` 服务暴露的 `root`，因此 profile 给 attachment-local 配的 `dshHome` 也会自动生效；没有 `root` 时不做附件清理并返回 `unverified`，同样不会退回默认目录。spill 取本地 `spillStore.root`；默认进程级 root 会额外扫描 `tmpdir()/dsh-spill-*` 兄弟目录，配置了 `config.root` 时只清理配置 root。派生投影缓存按随附组合的 storage-domain 布局放在 `<DSH_HOME>/storages/session_projcache/sessions`。
+会话根目录取 `sessionPersistence.config.root`（公开配置；没有时再退回 JSONL 的已解析 `root`），profile 重定位后端时它仍是准确的；两者都没有时插件返回 `unsupported`，不退回到某个默认目录。附件仓库取已挂载的 `attachments` 服务暴露的 `root`，因此 profile 给 attachment-local 配的 `dshHome` 也会自动生效；没有 `root` 时不做附件清理并返回 `unverified`，同样不会退回默认目录。spill 取本地 `spillStore.root`；默认进程级 root 会额外扫描同一父目录下严格匹配 `dsh-spill-` 加 6 位字母数字的兄弟目录，配置了 `config.root` 时只清理配置 root。派生投影缓存按已挂载 `storage` hub 的 JSON backend root 放在 `<storageRoot>/session_projcache/sessions`；根不可确认时不做删除。
 
 `DSH_HOME` 的解析与 `dsh-home-paths` 一致：空或仅含空白视为未设置，支持 `~` 展开，并规范化为绝对路径；未设置时用 `~/.dsh`。
 
@@ -143,20 +147,21 @@ dsh plugin --profile desktop add @acomma/dsh-session-delete@1.0.1
 npm test
 ```
 
-共 71 项（Host 64 + Client 7），覆盖：附件引用计数与 fail-closed（不可读、超时、catalog 缺项、重复目录、编码目录、pending 幸存会话、存活会话内存事件、目录型 artifact）、分页读取、非推进/跳读读取、叶子优先删除顺序、链接目录与拒绝删除、暂存清理、只读对象删除、projection cache 与链接目录、存储根解析（backend `root`/`config.root`/`attachments.root`/缺失根）、二次/三次 live 检查、schedule API（含旧模型拒绝、部分删除副作用）、提醒删除失败、spill 清理（普通 fork、旧私有 root、配置 root）、workspace 归档/置顶清理、subagent 根拒绝、非 ASCII/带空格/分隔符/~ ID、行移除广播，以及客户端的 job/list-failed 错误映射、fork 文案、提醒副作用提示和 remoteAccess 门控。
+共 87 项（Host 79 + Client 8；Windows 上 1 项 POSIX 权限用例跳过），覆盖：附件引用计数与 fail-closed（不可读、超时、catalog 缺项、重复目录、编码目录、pending 幸存会话、存活会话内存事件、幸存 migration-required 写租约不可探测、目录型 artifact、附件根不可用）、分页读取、非推进/跳读读取、深度优先删除与失败祖先保留、超深 subagent 链、缺失中间父会话、无 `origin` 的中间 subagent、树完整性预检、migration-required tree 写租约探测、链接目录与拒绝删除、暂存清理、只读对象删除、projection cache（默认根、storage backend 根、链接目录）、存储根解析（backend `root`/`config.root`/`attachments.root`/缺失根）、二次/三次 live 检查、activity waterfall、跨进程写租约探测、pending 子会话祖先检查、schedule API（含旧模型拒绝、部分删除副作用）、提醒删除失败、spill 清理（普通 fork、旧私有 root、精确 root 形状、POSIX 信任检查、未知父链、配置 root）、workspace 成员/归档/置顶清理、subagent 根拒绝、非 ASCII/带空格/分隔符/~ ID、行移除广播，以及客户端的 job/writer/list-failed 错误映射、fork 文案、提醒副作用提示、响应体超时和 remoteAccess 门控。
 
 ## 已知限制
 
 - 安装或更新后，若界面仍是旧版本：在 Plugin Manager 里关闭再开启本 bundle（会热替换 Client 模块），或重启 DSH。
 - 打开过的会话会被 Host 预热一个 Agent 并持有日志写句柄；DSH 没有释放单个 Agent 的 API，只能重启 Harness 后再删除，刷新页面无效。
 - 清理附件（默认勾选）且会话较多时，Host 需要顺序读取每个保留会话的完整事件流来核对引用；对仍存活的保留会话还要合并内存快照，删除耗时明显增加，客户端超时相应放宽到 180 秒。
-- 当前 Build 无法读取的会话不会出现在 `sessionPersistence.list()` 里；现在这类目录会让附件清理直接放弃（`reason = "catalog"`），不再冒险删除。
+- 当前 Build 无法读取的会话不会出现在 `sessionPersistence.list()` 里。根会话所在 project 下出现这种目录时，删除会以 `tree-incomplete` 拒绝，避免留下孤儿子会话；其他 project 的未知目录只让附件/spill 清理返回 `unverified`，不影响根删除。
 - **未发送的草稿附件**不写入任何会话日志：如果它的字节恰好与待删会话引用的对象相同（内容寻址会去重），该对象会被当成无人引用而删除，草稿里的图片随之失效。概率极低，但无法在 Host 侧核对。
 - 引用核对基于删除时刻的日志快照：如果另一个会话同时上传了**相同字节**（内容寻址会去重成同一个对象）并写入引用，极小概率下该对象会被删除。
-- **跨进程写者/冷写句柄**：DSH 的 JSONL 写租约是跨进程的，但本插件只能检查本进程的 Agent/Session/job；另一个进程持有的写句柄，或当前进程内直接打开日志写句柄的服务，插件无法通过公共 API 检测。最稳妥的长期方案是上游提供 `sessionPersistence` 删除 API。
+- **跨进程写者/冷写句柄**：DSH 的 JSONL 写租约是跨进程的。插件会对已 materialize 的 tree 会话做一次 `open(id, 'write')` 短探测：另一个进程持有写句柄时返回 `live` / `reason = "writer"`。`migration-required` 的 tree 日志也允许探测；写打开会先发布 migration，随后目录被删除，若删除失败则留下已迁移但完整的会话。成功探测只缩小竞争窗口，不能在探测与 `rm` 之间提供原子互斥；最稳妥的长期方案仍是上游提供 `sessionPersistence` 删除 API。
+- **另一个进程中的幸存 live 会话**：附件核对会先对非本进程 live、已 materialize 的幸存会话做 write-lease 探测；`current` 探测忙时保留全部附件（`reason = "writer"`）。幸存会话的 `migration-required`/未知格式不做写打开（避免为一次核对发布 migration），直接保留全部附件（同样 `reason = "writer"`）；pending（本进程不可见）也无法探测，仍需上游提供跨进程删除/引用核对 API。
 - **客户端超时/断开不会回滚**：删除一旦开始在 Host 上执行就会继续到结束；页面超时后应刷新确认，而不是立即重试。
-- spill 的幸存判断对 subagent 走 `parentSession` 链；当前普通 fork 只写 `isSeeded`，所以插件保守地对任何存活 `isSeeded` 会话保留 spill，可能留下本可清理的文件。如果某个 locator 被外部复制到无关会话，插件仍无法追踪。
-- 默认 spill root 的旧兄弟目录只在同一个父目录下发现；如果进程间改过 `TMPDIR`/`TEMP`，更早的 root 不在扫描范围内，交给 DSH 自己的保留策略。
+- spill 的幸存判断对 subagent 走 `parentSession` 链；当前普通 fork 只写 `isSeeded`，所以插件保守地对任何存活 `isSeeded` 会话保留 spill，可能留下本可清理的文件。父链无法解析时也按“未知祖先”保留。如果某个 locator 被外部复制到无关会话，插件仍无法追踪。
+- 默认 spill root 的旧兄弟目录只在同一个父目录下发现，要求目录名严格匹配 `dsh-spill-` 加 6 位字母数字，并在 POSIX 上检查 root 归当前用户所有、group/other 不可写，祖先目录必须不可被 group/other 写或带有 sticky 位；如果进程间改过 `TMPDIR`/`TEMP`，更早的 root 不在扫描范围内，交给 DSH 自己的保留策略。
 - 终端 / CLI 等非 Web 组合没有 `connection` 服务，本插件在这些 profile 中保持不激活。
 
 ## 许可证

@@ -44,6 +44,8 @@ window.__ModuleLoader__.load({
       'dialog.successDescription': '存储日志已从磁盘删除，侧边栏行已移除。',
       'dialog.close': '关闭',
       'error.live': '该会话已被 DSH 在后台激活：打开过一次的会话会预热一个 Agent，并持有日志的写入句柄；Host 进程内没有释放入口。请重启 Harness 后再删除（刷新页面无效）。',
+      'error.liveWriter': '该会话仍被另一个进程或未释放的写入句柄持有；请关闭该进程/句柄后再删除。',
+      'error.liveActivity': 'DSH 的 workspace 活动检查仍报告该会话有活动；请先停止相关工作再删除。',
       'error.liveJob': '该会话还有运行中的后台任务，请先停止它们再删除。',
       'error.not-found': '该会话不存在或已被删除。',
       'error.invalid-id': '会话 ID 无效。',
@@ -54,6 +56,7 @@ window.__ModuleLoader__.load({
       'error.unavailable': '会话存储服务不可用。',
       'error.unsupported': '当前会话后端没有可解析的文件系统根目录，无法通过本插件删除。',
       'error.ambiguous': '会话目录与 catalog 不一致，或同一 ID 存在多个目录；为避免删错，已拒绝删除。',
+      'error.treeIncomplete': '会话树不完整：有 subagent 子会话或其目录无法识别，为避免留下无法再删除的孤儿子会话，已拒绝删除。',
       'error.scheduleFailed': '无法删除绑定在该会话上的提醒；会话文件没有改动。',
       'error.liveCheckFailed': '无法确认会话是否仍在运行；为安全起见已拒绝删除。',
       'error.subagentSession': 'subagent 子会话不能单独删除；请删除它的父会话。',
@@ -89,6 +92,8 @@ window.__ModuleLoader__.load({
       'dialog.successDescription': 'The stored log was deleted and its sidebar row removed.',
       'dialog.close': 'Close',
       'error.live': 'DSH activated this session in the background: opening a session once pre-warms an Agent that holds the log write handle, and the Host process exposes no way to release it. Restart Harness, then delete it (reloading the page does not help).',
+      'error.liveWriter': 'This session is still held by another process or an unreleased write handle. Close that process or handle, then delete it.',
+      'error.liveActivity': 'DSH still reports workspace activity for this session. Stop that work before deleting it.',
       'error.liveJob': 'This session still has running background jobs. Stop them before deleting it.',
       'error.not-found': 'This session does not exist or was already deleted.',
       'error.invalid-id': 'The session id is invalid.',
@@ -99,6 +104,7 @@ window.__ModuleLoader__.load({
       'error.unavailable': 'The session persistence service is unavailable.',
       'error.unsupported': 'This session backend exposes no filesystem root, so this plugin cannot delete it.',
       'error.ambiguous': 'The session directory does not match the catalog, or the id has multiple directories; deletion was refused to avoid removing the wrong data.',
+      'error.treeIncomplete': 'The session tree is incomplete: a subagent sub-session or its directory cannot be identified, so deletion was refused to avoid leaving an orphan that this plugin cannot delete later.',
       'error.scheduleFailed': 'The reminders bound to this session could not be removed; no session files were changed.',
       'error.liveCheckFailed': 'Liveness could not be determined, so deletion was refused.',
       'error.subagentSession': 'A subagent sub-session cannot be deleted on its own; delete its parent session instead.',
@@ -182,6 +188,10 @@ window.__ModuleLoader__.load({
         } catch {
           /* an empty or non-JSON answer is reported through the status */
         }
+        // The request timer also bounds response-body consumption. `fetch`
+        // resolves as soon as headers arrive, so an abort during `json()` is
+        // otherwise swallowed here and misreported as an HTTP failure.
+        if (controller.signal.aborted) return { ok: false, code: 'timeout', message: '' }
       } catch (error) {
         if (controller.signal.aborted) return { ok: false, code: 'timeout', message: '' }
         return { ok: false, code: 'network', message: error instanceof Error ? error.message : String(error) }
@@ -202,7 +212,13 @@ window.__ModuleLoader__.load({
     function errorText(result, t) {
       switch (result.code) {
         case 'live':
-          return result.reason === 'job' ? t('error.liveJob') : t('error.live')
+          return result.reason === 'job'
+            ? t('error.liveJob')
+            : result.reason === 'writer'
+              ? t('error.liveWriter')
+              : result.reason === 'agent' || result.reason === 'session'
+                ? t('error.live')
+                : t('error.liveActivity')
         case 'not-found':
           return t('error.not-found')
         case 'invalid-id':
@@ -221,6 +237,8 @@ window.__ModuleLoader__.load({
           return t('error.unsupported')
         case 'ambiguous':
           return t('error.ambiguous')
+        case 'tree-incomplete':
+          return t('error.treeIncomplete')
         case 'schedule-failed':
           return t('error.scheduleFailed')
         case 'live-check-failed':
@@ -467,8 +485,10 @@ window.__ModuleLoader__.load({
       // The built-in archive action is a footer (afterContent) contribution at
       // order 600; order 700 with afterContent places this directly after it.
       const t = ctx.locale.bind(NS)
-      // remoteAccess is optional: a profile without it keeps the legacy
-      // local-only action, while a shared Web peer is gated before rendering.
+      // remoteAccess is optional. The exact route is owner-only and
+      // `session/delete` is not a grantable Remote endpoint, so this gate
+      // effectively keeps the action owner-only; a profile without remoteAccess
+      // keeps the legacy local action.
       const accessSource = (sessionId) => ctx.get?.('remoteAccess')?.source?.('session', sessionId, 'session/delete')
       const canDelete = (sessionId) => {
         const source = accessSource(sessionId)

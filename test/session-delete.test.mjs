@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { deleteSession } from '../index.js'
 
 const DIGEST_A = 'a'.repeat(64)
@@ -103,6 +103,7 @@ function persistenceOf(sessions) {
         revision: `rev-${session.header.id}`,
         eventCount: session.events.length,
         sizeBytes: 16,
+        ...(session.formatStatus === undefined ? {} : { formatStatus: session.formatStatus }),
         ...(session.location === undefined ? {} : { location: session.location }),
       }))
     },
@@ -298,6 +299,62 @@ test('keeps every object when a surviving session cannot be read', async (t) => 
   assert.equal(await exists(imagePath), true)
 })
 
+test('keeps every object when another process still writes a surviving session', async (t) => {
+  const home = await makeHome(t)
+  await addSessionDirectory(home, 'session-a')
+  const survivor = await addSessionDirectory(home, 'session-b')
+  const imagePath = await addImageObject(home, DIGEST_A)
+  const persistence = persistenceOf([
+    { header: snapshot('session-a').header, events: [headerEvent(), imageEvent(1, DIGEST_A)] },
+    {
+      header: snapshot('session-b').header,
+      events: [headerEvent()],
+      formatStatus: 'current',
+      location: { kind: 'jsonl', path: join(survivor, 'session.v4.jsonl') },
+    },
+  ])
+  const open = persistence.open
+  persistence.open = async (id, access, options) => {
+    if (id === 'session-b' && access === 'write') {
+      const error = new Error('held by another process')
+      error.name = 'SessionAlreadyOwnedError'
+      throw error
+    }
+    return open(id, access, options)
+  }
+  const ctx = ctxOf(persistence)
+
+  const result = await deleteSession(ctx, 'session-a', { deleteAttachments: true })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.attachments.status, 'unverified')
+  assert.equal(result.attachments.reason, 'writer')
+  assert.equal(await exists(imagePath), true)
+})
+
+test('keeps every object when a surviving migration-required log cannot be lease-probed', async (t) => {
+  const home = await makeHome(t)
+  await addSessionDirectory(home, 'session-a')
+  const survivor = await addSessionDirectory(home, 'session-b')
+  const imagePath = await addImageObject(home, DIGEST_A)
+  const ctx = ctxOf(persistenceOf([
+    { header: snapshot('session-a').header, events: [headerEvent(), imageEvent(1, DIGEST_A)] },
+    {
+      header: snapshot('session-b').header,
+      events: [headerEvent()],
+      formatStatus: 'migration-required',
+      location: { kind: 'jsonl', path: join(survivor, 'session.v3.jsonl') },
+    },
+  ]))
+
+  const result = await deleteSession(ctx, 'session-a', { deleteAttachments: true })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.attachments.status, 'unverified')
+  assert.equal(result.attachments.reason, 'writer')
+  assert.equal(await exists(imagePath), true)
+})
+
 test('keeps every object when a surviving live session log is still pending', async (t) => {
   const home = await makeHome(t)
   await addSessionDirectory(home, 'session-a')
@@ -446,6 +503,101 @@ test('names an open session as the reason a deletion is refused', async (t) => {
   assert.equal(await exists(directory), true)
 })
 
+test('honors a workspace activity provider before deleting', async (t) => {
+  const home = await makeHome(t)
+  const directory = await addSessionDirectory(home, 'session-a')
+  const ctx = ctxOf(persistenceOf([{ header: snapshot('session-a').header, events: [headerEvent()] }]))
+  ctx.waterfall = async () => [{ kind: 'custom' }]
+
+  const result = await deleteSession(ctx, 'session-a')
+
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'live')
+  assert.equal(result.reason, 'custom')
+  assert.equal(await exists(directory), true)
+})
+
+test('names a pending subagent descendant that is not in the catalog', async (t) => {
+  const home = await makeHome(t)
+  const directory = await addSessionDirectory(home, 'session-a')
+  const persistence = persistenceOf([
+    { header: snapshot('session-a').header, events: [headerEvent()] },
+  ])
+  const ctx = ctxWith(persistence, {
+    sessions: {
+      get: () => undefined,
+      list: () => [{
+        id: 'session-pending-child',
+        header: { id: 'session-pending-child', version: 4, createdAt: 2, cwd: '/work', origin: 'subagent', parentSession: 'session-a' },
+      }],
+    },
+  })
+
+  const result = await deleteSession(ctx, 'session-a', { deleteAttachments: true })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'live')
+  assert.equal(result.reason, 'session')
+  assert.equal(result.sessionId, 'session-pending-child')
+  assert.equal(await exists(directory), true)
+})
+
+test('refuses a session held by another process write lease', async (t) => {
+  const home = await makeHome(t)
+  const directory = await addSessionDirectory(home, 'session-a')
+  const persistence = persistenceOf([{
+    header: snapshot('session-a').header,
+    events: [headerEvent()],
+    formatStatus: 'current',
+    location: { kind: 'jsonl', path: join(directory, 'session.v4.jsonl') },
+  }])
+  const open = persistence.open
+  persistence.open = async (id, access) => {
+    if (access === 'write') {
+      const error = new Error('held by another process')
+      error.name = 'SessionAlreadyOwnedError'
+      throw error
+    }
+    return open(id, access)
+  }
+  const ctx = ctxOf(persistence)
+
+  const result = await deleteSession(ctx, 'session-a')
+
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'live')
+  assert.equal(result.reason, 'writer')
+  assert.equal(await exists(directory), true)
+})
+
+test('probes a migration-required tree session before deleting it', async (t) => {
+  const home = await makeHome(t)
+  const directory = await addSessionDirectory(home, 'session-a')
+  const persistence = persistenceOf([{
+    header: snapshot('session-a').header,
+    events: [headerEvent()],
+    formatStatus: 'migration-required',
+    location: { kind: 'jsonl', path: join(directory, 'session.v3.jsonl') },
+  }])
+  const open = persistence.open
+  persistence.open = async (id, access, options) => {
+    if (access === 'write') {
+      const error = new Error('held by another process')
+      error.name = 'SessionAlreadyOwnedError'
+      throw error
+    }
+    return open(id, access, options)
+  }
+  const ctx = ctxOf(persistence)
+
+  const result = await deleteSession(ctx, 'session-a')
+
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'live')
+  assert.equal(result.reason, 'writer')
+  assert.equal(await exists(directory), true)
+})
+
 test('names a running job as the reason a deletion is refused', async (t) => {
   const home = await makeHome(t)
   await addSessionDirectory(home, 'session-a')
@@ -515,6 +667,130 @@ test('treats an already-absent child directory as already deleted', async (t) =>
     ['api-session/removed', 'session-a'],
     ['api-session/removed', 'session-child'],
   ])
+})
+
+test('refuses a readable grandchild whose intermediate parent is not in the catalog', async (t) => {
+  const home = await makeHome(t)
+  const root = await addSessionDirectory(home, 'session-a')
+  const grandchild = await addSessionDirectory(home, 'session-grandchild')
+  const persistence = persistenceOf([
+    { header: snapshot('session-a').header, events: [headerEvent()] },
+    {
+      header: { ...snapshot('session-grandchild').header, origin: 'subagent', parentSession: 'session-missing-child' },
+      events: [headerEvent()],
+    },
+  ])
+  const ctx = ctxOf(persistence)
+
+  const result = await deleteSession(ctx, 'session-a')
+
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'tree-incomplete')
+  assert.equal(await exists(root), true)
+  assert.equal(await exists(grandchild), true)
+})
+
+test('refuses a subagent descendant behind a readable intermediate without origin', async (t) => {
+  const home = await makeHome(t)
+  const root = await addSessionDirectory(home, 'session-a')
+  await addSessionDirectory(home, 'session-child')
+  await addSessionDirectory(home, 'session-grandchild')
+  const persistence = persistenceOf([
+    { header: snapshot('session-a').header, events: [headerEvent()] },
+    {
+      // A normal fork would omit parentSession; this intermediate has a parent
+      // link but lost its subagent origin.
+      header: { ...snapshot('session-child').header, parentSession: 'session-a' },
+      events: [headerEvent()],
+    },
+    {
+      header: { ...snapshot('session-grandchild').header, origin: 'subagent', parentSession: 'session-child' },
+      events: [headerEvent()],
+    },
+  ])
+  const ctx = ctxOf(persistence)
+
+  const result = await deleteSession(ctx, 'session-a')
+
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'tree-incomplete')
+  assert.equal(await exists(root), true)
+})
+
+test('refuses a same-project session directory the catalog cannot name', async (t) => {
+  const home = await makeHome(t)
+  const root = await addSessionDirectory(home, 'session-a')
+  const ghost = await addSessionDirectory(home, 'session-ghost')
+  const imagePath = await addImageObject(home, DIGEST_A)
+  const ctx = ctxOf(persistenceOf([
+    { header: snapshot('session-a').header, events: [headerEvent(), imageEvent(1, DIGEST_A)] },
+  ]))
+
+  const result = await deleteSession(ctx, 'session-a', { deleteAttachments: true })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'tree-incomplete')
+  assert.equal(await exists(root), true)
+  assert.equal(await exists(ghost), true)
+  assert.equal(await exists(imagePath), true)
+})
+
+test('removes a subagent chain deeper than the old depth cap', async (t) => {
+  const home = await makeHome(t)
+  const sessions = []
+  const ids = []
+  for (let index = 0; index <= 70; index += 1) {
+    const id = `deep-${index}`
+    ids.push(id)
+    await addSessionDirectory(home, id)
+    sessions.push({
+      header: {
+        ...snapshot(id).header,
+        ...(index === 0 ? {} : { origin: 'subagent', parentSession: ids[index - 1] }),
+      },
+      events: [headerEvent()],
+    })
+  }
+  const ctx = ctxOf(persistenceOf(sessions))
+
+  const result = await deleteSession(ctx, ids[0])
+
+  assert.equal(result.ok, true)
+  assert.equal(result.deleted.length, ids.length)
+  for (const id of ids) assert.equal(await exists(join(home, 'sessions', '--work--', id)), false)
+})
+
+test('keeps the failed directory ancestors when a child delete fails', async (t) => {
+  const home = await makeHome(t)
+  const root = await addSessionDirectory(home, 'session-a')
+  const child = await addSessionDirectory(home, 'session-child')
+  const grandchild = await addSessionDirectory(home, 'session-grandchild')
+  const sessions = [
+    { header: snapshot('session-a').header, events: [headerEvent()] },
+    { header: { ...snapshot('session-child').header, origin: 'subagent', parentSession: 'session-a' }, events: [headerEvent()] },
+    { header: { ...snapshot('session-grandchild').header, origin: 'subagent', parentSession: 'session-child' }, events: [headerEvent()] },
+  ]
+  const ctx = ctxOf(persistenceOf(sessions))
+
+  const first = await deleteSession(ctx, 'session-a', {
+    removeDirectory: async (_root, directory) => {
+      if (basename(directory) === 'session-grandchild') throw new Error('injected delete failure')
+      await rm(directory, { recursive: true })
+    },
+  })
+
+  assert.equal(first.ok, false)
+  assert.equal(first.code, 'partial')
+  assert.deepEqual(first.failed.map((entry) => entry.sessionId), ['session-grandchild'])
+  assert.equal(await exists(root), true)
+  assert.equal(await exists(child), true)
+  assert.equal(await exists(grandchild), true)
+
+  const retry = await deleteSession(ctx, 'session-a')
+  assert.equal(retry.ok, true)
+  assert.equal(await exists(root), false)
+  assert.equal(await exists(child), false)
+  assert.equal(await exists(grandchild), false)
 })
 
 /** A directory link: a junction on Windows, a directory symlink elsewhere. */
@@ -613,7 +889,7 @@ test('keeps every object when reading the deleted log outlives the budget', asyn
 test('keeps every object when a stored directory is missing from the catalog', async (t) => {
   const home = await makeHome(t)
   await addSessionDirectory(home, 'session-a')
-  await addSessionDirectory(home, 'session-ghost')
+  await addSessionDirectory(home, 'session-ghost', '--other--')
   const imagePath = await addImageObject(home, DIGEST_A)
   const ctx = ctxOf(persistenceOf([
     { header: snapshot('session-a').header, events: [headerEvent(), imageEvent(1, DIGEST_A)] },
@@ -805,6 +1081,7 @@ test('does not treat an encoded session directory as an unknown reference', asyn
     {
       header: { ...snapshot('my session').header },
       events: [headerEvent()],
+      formatStatus: 'current',
       location: { kind: 'jsonl', path: join(weird, 'session.v4.jsonl.zstd') },
     },
   ]))
@@ -1124,6 +1401,30 @@ test('removes the per-session projection cache and its backups', async (t) => {
   assert.equal(await exists(otherPath), true)
 })
 
+test('uses the mounted storage backend root for projection-cache cleanup', async (t) => {
+  const home = await makeHome(t)
+  await addSessionDirectory(home, 'session-a')
+  const customRoot = join(home, 'custom-storages')
+  const customCacheDirectory = join(customRoot, 'session_projcache', 'sessions')
+  await mkdir(customCacheDirectory, { recursive: true })
+  const customCache = join(customCacheDirectory, 'session-a.json')
+  await writeFile(customCache, '{}')
+  const defaultCacheDirectory = join(home, 'storages', 'session_projcache', 'sessions')
+  await mkdir(defaultCacheDirectory, { recursive: true })
+  const defaultCache = join(defaultCacheDirectory, 'session-a.json')
+  await writeFile(defaultCache, '{}')
+  const ctx = ctxWith(
+    persistenceOf([{ header: snapshot('session-a').header, events: [headerEvent()] }]),
+    { storage: { backend: { get: () => ({ root: customRoot }) } } },
+  )
+
+  const result = await deleteSession(ctx, 'session-a')
+
+  assert.equal(result.caches, 1)
+  assert.equal(await exists(customCache), false)
+  assert.equal(await exists(defaultCache), true)
+})
+
 test('does not follow a linked projection-cache directory', async (t) => {
   const home = await makeHome(t)
   await addSessionDirectory(home, 'session-a')
@@ -1145,7 +1446,7 @@ test('does not follow a linked projection-cache directory', async (t) => {
 test('keeps spill files when the stored-directory catalog is incomplete', async (t) => {
   const home = await makeHome(t)
   await addSessionDirectory(home, 'session-a')
-  await addSessionDirectory(home, 'session-ghost')
+  await addSessionDirectory(home, 'session-ghost', '--other--')
   const spillRoot = join(home, 'spill')
   const spillDirectory = join(spillRoot, spillKey('session-a'))
   await mkdir(spillDirectory, { recursive: true })
@@ -1158,6 +1459,34 @@ test('keeps spill files when the stored-directory catalog is incomplete', async 
   const result = await deleteSession(ctx, 'session-a')
 
   assert.equal(result.spill.status, 'unverified')
+  assert.equal(result.spill.kept, 1)
+  assert.equal(await exists(spillDirectory), true)
+})
+
+test('keeps spill files when a surviving descendant has an unresolved parent', async (t) => {
+  const home = await makeHome(t)
+  await addSessionDirectory(home, 'session-a')
+  const orphan = await addSessionDirectory(home, 'session-orphan', '--other--')
+  const spillRoot = join(home, 'spill-roots', 'dsh-spill-abc123')
+  const spillDirectory = join(spillRoot, spillKey('session-a'))
+  await mkdir(spillDirectory, { recursive: true })
+  await writeFile(join(spillDirectory, 'result.txt'), 'full result')
+  const ctx = ctxWith(
+    persistenceOf([
+      { header: snapshot('session-a').header, events: [headerEvent()] },
+      {
+        header: { ...snapshot('session-orphan').header, origin: 'subagent', parentSession: 'missing-parent' },
+        events: [headerEvent()],
+        location: { kind: 'jsonl', path: join(orphan, 'session.v4.jsonl') },
+      },
+    ]),
+    { spillStore: { root: spillRoot } },
+  )
+
+  const result = await deleteSession(ctx, 'session-a')
+
+  assert.equal(result.ok, true)
+  assert.equal(result.spill.deleted, 0)
   assert.equal(result.spill.kept, 1)
   assert.equal(await exists(spillDirectory), true)
 })
@@ -1315,7 +1644,7 @@ test('counts attachments still present only in a live session snapshot', async (
 test('treats an unaccounted session directory with only a subdirectory as an artifact', async (t) => {
   const home = await makeHome(t)
   await addSessionDirectory(home, 'session-a')
-  await mkdir(join(home, 'sessions', '--work--', 'session-ghost', 'nested'), { recursive: true })
+  await mkdir(join(home, 'sessions', '--other--', 'session-ghost', 'nested'), { recursive: true })
   const imagePath = await addImageObject(home, DIGEST_A)
   const ctx = ctxOf(persistenceOf([
     { header: snapshot('session-a').header, events: [headerEvent(), imageEvent(1, DIGEST_A)] },
@@ -1333,9 +1662,10 @@ test('removes spill files from prior private spill roots', async (t) => {
   const home = await makeHome(t)
   await addSessionDirectory(home, 'session-a')
   const parent = join(home, 'spill-roots')
-  const current = join(parent, 'dsh-spill-current')
-  const prior = join(parent, 'dsh-spill-prior')
-  for (const root of [current, prior]) {
+  const current = join(parent, 'dsh-spill-abc123')
+  const prior = join(parent, 'dsh-spill-def456')
+  const unrelated = join(parent, 'dsh-spill-test-extra')
+  for (const root of [current, prior, unrelated]) {
     const directory = join(root, spillKey('session-a'))
     await mkdir(directory, { recursive: true })
     await writeFile(join(directory, 'result.txt'), 'full result')
@@ -1350,6 +1680,31 @@ test('removes spill files from prior private spill roots', async (t) => {
   assert.equal(result.spill.deleted, 2)
   assert.equal(await exists(join(current, spillKey('session-a'))), false)
   assert.equal(await exists(join(prior, spillKey('session-a'))), false)
+  assert.equal(await exists(join(unrelated, spillKey('session-a'))), true)
+})
+
+test('skips a group-writable sibling private spill root', { skip: process.platform === 'win32' }, async (t) => {
+  const home = await makeHome(t)
+  await addSessionDirectory(home, 'session-a')
+  const parent = join(home, 'spill-roots')
+  const current = join(parent, 'dsh-spill-abc123')
+  const untrusted = join(parent, 'dsh-spill-def456')
+  for (const root of [current, untrusted]) {
+    const directory = join(root, spillKey('session-a'))
+    await mkdir(directory, { recursive: true })
+    await writeFile(join(directory, 'result.txt'), 'full result')
+  }
+  await chmod(untrusted, 0o777)
+  const ctx = ctxWith(
+    persistenceOf([{ header: snapshot('session-a').header, events: [headerEvent()] }]),
+    { spillStore: { root: current } },
+  )
+
+  const result = await deleteSession(ctx, 'session-a')
+
+  assert.equal(result.spill.deleted, 1)
+  assert.equal(await exists(join(current, spillKey('session-a'))), false)
+  assert.equal(await exists(join(untrusted, spillKey('session-a'))), true)
 })
 
 test('does not scan sibling spill roots when the backend root is configured', async (t) => {
@@ -1439,13 +1794,18 @@ test('reports reminders removed before a later reminder failure', async (t) => {
   assert.equal(await exists(directory), true)
 })
 
-test('clears stale workspace archive and pin entries after a successful delete', async (t) => {
+test('clears stale workspace membership, archive, and pin entries after a successful delete', async (t) => {
   const home = await makeHome(t)
   await addSessionDirectory(home, 'session-a')
   const calls = []
+  const workspace = {
+    sessionIds: ['session-a'],
+    async detachSession(id) { calls.push(`detach:${id}`) },
+  }
   const workspaceRegistry = {
     archivedSessionIds: ['session-a'],
     pinnedSessionIds: ['session-a'],
+    list: () => [workspace],
     async unarchiveSession(id) { calls.push(`unarchive:${id}`) },
     async unpinSession(id) { calls.push(`unpin:${id}`) },
   }
@@ -1457,7 +1817,7 @@ test('clears stale workspace archive and pin entries after a successful delete',
   const result = await deleteSession(ctx, 'session-a')
 
   assert.equal(result.ok, true)
-  assert.deepEqual(calls, ['unarchive:session-a', 'unpin:session-a'])
+  assert.deepEqual(calls, ['detach:session-a', 'unarchive:session-a', 'unpin:session-a'])
 })
 
 test('ignores legacy reminders that target another session', async (t) => {

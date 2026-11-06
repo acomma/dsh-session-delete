@@ -343,6 +343,28 @@ test('describes that ordinary forks are not deleted', async () => {
   assert.match(modal.props.description, /Forked sessions are not deleted/)
 })
 
+test('reports a timeout when the response body outlives the request budget', async () => {
+  const harness = makeHarness()
+  const { context } = applyClient(harness)
+  const action = harness.menu.resolve({ sessionId: 'session-a', displayTitle: 'A' })[0]
+  await action.run()
+  const t = translatorFor(harness, 'session-delete')
+  const outerSetTimeout = setTimeout
+  // The abort fires after fetch resolves but while response.json() is pending.
+  context.setTimeout = (callback, _milliseconds) => outerSetTimeout(callback, 1)
+  context.fetch = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      await new Promise((_resolve, reject) => outerSetTimeout(() => reject(new Error('body aborted')), 25))
+    },
+  })
+
+  await confirmButton(renderDialog(harness, t), harness.Button, t).props.onClick()
+
+  assert.match(textOf(renderDialog(harness, t)), /timed out/)
+})
+
 test('warns when reminders were removed before a later failure', async () => {
   const harness = makeHarness()
   const { context } = applyClient(harness)
@@ -378,4 +400,15 @@ test('maps the subagent-session refusal to its localized message', async () => {
   context.fetch = async () => response({ ok: false, code: 'subagent-session', message: 'host message' }, 409)
   await confirmButton(renderDialog(harness, t), harness.Button, t).props.onClick()
   assert.match(textOf(renderDialog(harness, t)), /subagent sub-session cannot be deleted/)
+})
+
+test('maps tree-incomplete to its localized message', async () => {
+  const harness = makeHarness()
+  const { context } = applyClient(harness)
+  const action = harness.menu.resolve({ sessionId: 'session-a', displayTitle: 'A' })[0]
+  await action.run()
+  const t = translatorFor(harness, 'session-delete')
+  context.fetch = async () => response({ ok: false, code: 'tree-incomplete', message: 'host message' }, 409)
+  await confirmButton(renderDialog(harness, t), harness.Button, t).props.onClick()
+  assert.match(textOf(renderDialog(harness, t)), /session tree is incomplete/)
 })
