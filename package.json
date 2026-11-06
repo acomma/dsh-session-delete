@@ -24,7 +24,7 @@
   ],
   "main": "index.js",
   "scripts": {
-    "test": "node --test test/session-delete.test.mjs"
+    "test": "node --test test/session-delete.test.mjs test/client.test.mjs"
   },
   "exports": {
     ".": "./index.js",
@@ -44,7 +44,7 @@
     "LICENSE"
   ],
   "engines": {
-    "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+    "dsh": ">=0.2.2-rc.1 <0.2.3-0"
   },
   "publishConfig": {
     "access": "public"
@@ -57,6 +57,7 @@
       "platform": "web",
       "immediately": true,
       "inject": [
+        "@deepseek-ai/dsh-api-remote-access",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-context-menu",
         "@deepseek-ai/dsh-client-ui-renderer",

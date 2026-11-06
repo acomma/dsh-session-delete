@@ -5,21 +5,24 @@
  * seam stores one log per Session and documents that "nothing deletes session
  * files". This plugin adds exactly one narrow operation, reachable from the
  * Session row menu in the Web UI through an authenticated Fetch route. It
- * refuses a live Session, and deletes a cold Session's stored log together
- * with the logs of its subagent descendants.
+ * refuses a live Session and a subagent Session addressed as the root, and
+ * deletes a cold Session's stored log together with the logs of its subagent
+ * descendants.
  *
  * The session log directory is the authoritative Session artifact. Derived
  * caches, local spill directories, and content-addressed attachment blobs live
  * elsewhere. On request the caller may also reclaim attachment objects, but
  * only those no surviving Session references: an attachment is
  * content-addressed and immutable, so resumed and forked Sessions may share it
- * (see README.md). Spill directories are removed only when the catalog is
- * complete and no surviving Session descends from the deleted tree.
+ * (see README.md). Spill directories are removed only when the refreshed
+ * catalog is complete and no surviving Session descends from — or may descend
+ * from — the deleted tree, including an ordinary fork that carries only
+ * `isSeeded`.
  */
 import { createHash } from 'node:crypto'
 import { lstat, readdir, realpath, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 /** Absolute Fetch path; the browser calls the document-relative `api/session.delete`. */
 const ROUTE = '/api/session.delete'
@@ -40,6 +43,8 @@ const REFERENCE_READ_CHUNK = 2000
 const REFERENCE_SCAN_BUDGET_MS = 30000
 /** Staged attachment bytes older than this are abandoned writes, not in-flight uploads (generic files have no size limit, so the window is generous). */
 const STAGING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+/** Prefix of the per-process default spill roots created by `dsh-spill-local`. */
+const SPILL_ROOT_PREFIX = 'dsh-spill-'
 
 const FAILURE_MESSAGES = {
   'invalid-request': 'Expected a JSON body with a sessionId string.',
@@ -49,6 +54,7 @@ const FAILURE_MESSAGES = {
   'not-found': 'No stored session has that id.',
   live: 'The session is live. Close it and stop its work before deleting it.',
   'live-check-failed': 'Liveness could not be determined, so deletion was refused.',
+  'subagent-session': 'A subagent Session cannot be deleted on its own; delete its parent Session instead.',
   ambiguous: 'The stored session directory is ambiguous or does not match the catalog.',
   'schedule-failed': 'The session reminders could not be removed; no session files were deleted.',
   'directory-missing': 'The stored session has no directory under the session root.',
@@ -102,12 +108,12 @@ async function respond(ctx, request) {
 /**
  * Permanently delete one stored Session and its subagent descendants.
  *
- * Order: resolve the stored tree, refuse anything live, read the attachment
- * references while the logs still exist, prove the catalog accounts for every
- * stored Session directory, plan every deletion target from the catalog-resolved
- * location, re-check liveness, clear reminders, re-check liveness once more,
- * remove child directories before the root, then remove derived caches, spill
- * files, and unshared attachment objects.
+ * Order: resolve the stored tree, refuse a subagent root or anything live, read
+ * the attachment references while the logs still exist, plan every deletion
+ * target from the catalog-resolved location, re-check liveness, clear reminders,
+ * re-check liveness once more, remove child directories before the root, then
+ * re-scan the catalog and remove derived caches, spill files, and unshared
+ * attachment objects.
  *
  * The root directory is removed last so a child failure leaves the root and a
  * retry can finish the tree. A child directory already absent is treated as
@@ -150,6 +156,9 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
   const byId = new Map()
   for (const snapshot of snapshots) byId.set(String(snapshot.header.id), snapshot)
   if (!byId.has(sessionId)) return failure('not-found', sessionId)
+  if (byId.get(sessionId)?.header?.origin === 'subagent') {
+    return failure('subagent-session', sessionId)
+  }
 
   const tree = collectTree(byId, sessionId)
   const live = await checkLive(ctx, tree)
@@ -166,19 +175,9 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
 
     // A stored directory the catalog cannot name is an unknown reference: its
     // Session may hold the only other reference to a candidate object, so an
-    // incomplete catalog keeps every object. A scan failure never blocks the
-    // deletion itself.
-    let catalog
-    if ((owned !== undefined && locations.attachmentsRoot !== undefined) || locations.spillRoot !== undefined) {
-      try {
-        catalog = await inspectCatalog(locations.sessionRoot, byId)
-      } catch {
-        catalog = { incomplete: true, unaccounted: [], duplicates: [] }
-      }
-    }
-
-    // Narrow the refusal window: the Session may have been opened while its
-    // references were being read. Nothing has been removed yet.
+    // incomplete catalog keeps every object. The catalog is inspected after the
+    // logs are gone so it is as fresh as the eventual cleanup decision.
+    // A scan failure never blocks the deletion itself.
     const stillLive = await checkLive(ctx, tree)
     if (stillLive.error !== undefined) return failure('live-check-failed', sessionId, stillLive.error)
     if (stillLive.session !== undefined) {
@@ -187,8 +186,10 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
 
     // A live surviving Session whose log is still pending has attachment
     // references only in memory; opening its log would return an empty prefix.
-    // Keep every attachment rather than treating that unknown as "none".
-    const pendingSurvivor = hasPendingSurvivingSession(ctx, persistence, tree)
+    // Keep every attachment rather than treating that unknown as "none". The
+    // pending probe falls back to the public stat() snapshot when a backend
+    // does not expose the JSONL implementation's hasPendingSession().
+    const pendingSurvivor = await hasPendingSurvivingSession(ctx, persistence, tree)
 
     // Resolve every directory before removing anything. A duplicate id or a
     // catalog location that disagrees with the directory tree is refused here.
@@ -211,12 +212,19 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
     // touching logs, then check liveness again; `edit`/`delete` is serialized
     // behind an already running delivery.
     const scheduleOutcome = await clearSchedules(ctx, tree)
-    if (scheduleOutcome.error !== undefined) return failure('schedule-failed', sessionId, scheduleOutcome.error)
+    if (scheduleOutcome.error !== undefined) {
+      return withSchedulesRemoved(failure('schedule-failed', sessionId, scheduleOutcome.error), scheduleOutcome.removed)
+    }
 
     const afterSchedules = await checkLive(ctx, tree)
-    if (afterSchedules.error !== undefined) return failure('live-check-failed', sessionId, afterSchedules.error)
+    if (afterSchedules.error !== undefined) {
+      return withSchedulesRemoved(failure('live-check-failed', sessionId, afterSchedules.error), scheduleOutcome.removed)
+    }
     if (afterSchedules.session !== undefined) {
-      return { ...failure('live', afterSchedules.session.sessionId), reason: afterSchedules.session.reason }
+      return withSchedulesRemoved(
+        { ...failure('live', afterSchedules.session.sessionId), reason: afterSchedules.session.reason },
+        scheduleOutcome.removed,
+      )
     }
 
     const deleted = []
@@ -274,16 +282,35 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
       locations.projectionCacheRoot,
       gone,
     )
-    const spill = await deleteSpillDirectories(locations.spillRoot, byId, gone, catalog)
+    // A fork created while the deletion ran must be visible to the spill
+    // decision, and a new unaccounted session directory must keep attachment
+    // cleanup closed. Re-list and re-scan once after the logs are gone.
+    const latest = locations.spillRoot !== undefined
+      || (owned !== undefined && locations.attachmentsRoot !== undefined)
+      ? await refreshCatalog(persistence, locations.sessionRoot)
+      : { byId, catalog: undefined }
+    const spillRoots = await resolveSpillRoots(locations)
+    const spill = await deleteSpillDirectories(spillRoots, latest.byId, gone, latest.catalog)
     // Attachment candidates come from directories actually removed. A child
     // directory already absent keeps its referenced objects: without a stored
     // log the references cannot be proven absent.
-    const attachments = owned === undefined ? undefined : await settleAttachments(persistence, tree, deleted, owned, {
-      signal: budget.signal,
-      locations,
-      catalog,
-      pendingSurvivor,
-    })
+    const attachments = owned === undefined ? undefined : await settleAttachments(
+      persistence,
+      tree,
+      deleted,
+      owned,
+      ctx,
+      {
+        signal: budget.signal,
+        locations,
+        catalog: latest.catalog,
+        pendingSurvivor,
+      },
+    )
+    // Workspace archive/pin sets are not pruned by the registry's header
+    // refresh. Clear a stale id when the mounted registry exposes the public
+    // idempotent operations; failure is only stale derived state.
+    await clearWorkspaceSessionState(ctx, gone)
 
     // Announce that these Sessions left the catalog so a connected page drops
     // their rows immediately instead of keeping stale rows until a reload.
@@ -352,6 +379,28 @@ async function readSessionAttachmentRefs(persistence, sessionId, signal) {
     })
   })
   return refs
+}
+
+/**
+ * Re-list and re-scan the stored Session root after the deletion.
+ *
+ * A fork created while the deletion ran, or an unaccounted directory that
+ * appeared during it, is an unknown reference for the optional spill and
+ * attachment cleanup. A failed refresh is never treated as an empty catalog:
+ * the caller keeps every candidate.
+ * @param persistence - Session persistence service.
+ * @param sessionRoot - the Session persistence root.
+ * @returns the refreshed snapshots and catalog findings.
+ */
+async function refreshCatalog(persistence, sessionRoot) {
+  try {
+    const snapshots = await persistence.list()
+    const byId = new Map()
+    for (const snapshot of snapshots) byId.set(String(snapshot.header.id), snapshot)
+    return { byId, catalog: await inspectCatalog(sessionRoot, byId) }
+  } catch {
+    return { byId: new Map(), catalog: { incomplete: true, unaccounted: [], duplicates: [] } }
+  }
 }
 
 /**
@@ -436,17 +485,18 @@ function encodeSegment(raw) {
 }
 
 /**
- * Whether one stored Session directory holds any file. A log is the expected
- * artifact, but the directory is Session-owned and may carry future artifacts, so
- * anything stored there counts: a directory the catalog cannot name must never be
- * silently ignored. An empty directory names nothing and is ignored.
+ * Whether one stored Session directory holds any entry. A log is the expected
+ * artifact, but the directory is Session-owned and may carry future artifacts
+ * (including Session-owned subdirectories), so any entry counts: a directory
+ * the catalog cannot name must never be silently ignored. An empty directory
+ * names nothing and is ignored.
  * @param directory - the candidate Session directory.
  * @returns true/false, or undefined when the directory cannot be read.
  */
 async function hasSessionArtifact(directory) {
   try {
     const entries = await readdir(directory, { withFileTypes: true })
-    return entries.some((entry) => entry.isFile() || entry.isSymbolicLink())
+    return entries.length > 0
   } catch {
     return undefined
   }
@@ -527,10 +577,11 @@ function walkAttachmentRefs(roots, visit) {
  * @param tree - the Session ids the deletion addressed.
  * @param deletedIds - Sessions whose directory this request removed.
  * @param owned - attachment refs per tree Session, read before deletion.
+ * @param ctx - Host context carrying the optional live Session store.
  * @param options - the shared budget, resolved store roots, and catalog findings.
  * @returns the attachment report carried by the response.
  */
-async function settleAttachments(persistence, tree, deletedIds, owned, options) {
+async function settleAttachments(persistence, tree, deletedIds, owned, ctx, options) {
   const report = { status: 'applied', deleted: 0, kept: 0, failed: 0, missing: 0, bytes: 0, staging: 0 }
   if (options.locations.attachmentsRoot === undefined) {
     return { ...report, status: 'unverified', reason: 'unavailable' }
@@ -582,9 +633,23 @@ async function settleAttachments(persistence, tree, deletedIds, owned, options) 
     if (pending.size === 0) break
     const id = String(snapshot.header.id)
     if (deleted.has(id) || owned.refs.has(id)) continue
+    let live
+    try {
+      live = ctx.get('sessions')?.get?.(id)
+    } catch {
+      return { ...report, status: 'unverified', reason: options.signal.aborted ? 'timeout' : 'unreadable' }
+    }
     let found
     try {
-      found = await scanSessionForAttachments(persistence, id, pending, options.signal)
+      // The persisted log is the durable prefix. A live Session additionally
+      // carries events still in the routed write-behind buffer, so union its
+      // in-memory snapshot instead of choosing one source.
+      found = new Set(await scanSessionForAttachments(persistence, id, pending, options.signal))
+      if (live !== undefined && typeof live.snapshotEvents === 'function') {
+        walkAttachmentRefs(live.snapshotEvents(), (attachmentId) => {
+          if (pending.has(attachmentId)) found.add(attachmentId)
+        })
+      }
     } catch {
       return { ...report, status: 'unverified', reason: options.signal.aborted ? 'timeout' : 'unreadable' }
     }
@@ -691,8 +756,15 @@ async function deleteAttachmentObject(root, attachmentId) {
       blocked = true
       continue
     }
+    // Re-resolve the leaf itself. The parent check above narrows, but a leaf
+    // replaced between lstat() and rm() must not redirect the removal.
+    const realTargetInfo = await realpathOrError(target.path)
+    if (realTargetInfo.error !== undefined || !isInside(realRootInfo.path, realTargetInfo.path)) {
+      blocked = true
+      continue
+    }
     try {
-      await rm(target.path, { recursive: target.directory, force: true, maxRetries: 3, retryDelay: 100 })
+      await rm(realTargetInfo.path, { recursive: target.directory, force: true, maxRetries: 3, retryDelay: 100 })
     } catch {
       blocked = true
       continue
@@ -726,7 +798,7 @@ async function sweepStaging(root) {
   if (realDirectory.error !== undefined || !isInside(rootInfo.path, realDirectory.path)) return 0
   let entries
   try {
-    entries = await readdir(directory, { withFileTypes: true })
+    entries = await readdir(realDirectory.path, { withFileTypes: true })
   } catch {
     return 0
   }
@@ -734,7 +806,7 @@ async function sweepStaging(root) {
   let removed = 0
   for (const entry of entries) {
     if (!entry.isFile()) continue
-    const path = join(directory, entry.name)
+    const path = join(realDirectory.path, entry.name)
     const info = await lstat(path).catch(() => undefined)
     if (info === undefined || !info.isFile() || info.mtimeMs > cutoff) continue
     try {
@@ -911,13 +983,17 @@ async function checkLive(ctx, sessionIds) {
  * append/flush. Reading it through `open(..., 'read')` returns an empty prefix,
  * so its attachment references cannot be discovered. This is an unknown
  * reference, not an empty one; attachment cleanup must keep everything.
+ *
+ * `hasPendingSession()` is a JSONL implementation detail, so a backend without
+ * it is probed through the public `stat()` snapshot: a pending session has no
+ * materialized `location`. A failing probe is treated as unknown and keeps
+ * every attachment.
  * @param ctx - Host context.
  * @param persistence - Session persistence service.
  * @param tree - Sessions being deleted.
  * @returns true when a surviving live Session is still pending.
  */
-function hasPendingSurvivingSession(ctx, persistence, tree) {
-  if (typeof persistence.hasPendingSession !== 'function') return false
+async function hasPendingSurvivingSession(ctx, persistence, tree) {
   const sessions = ctx.get('sessions')
   if (sessions === undefined || typeof sessions.list !== 'function') return false
   const deleting = new Set(tree)
@@ -927,11 +1003,24 @@ function hasPendingSurvivingSession(ctx, persistence, tree) {
   } catch {
     return true
   }
+  const survivors = []
   for (const session of live) {
     const id = String(session?.id ?? '')
     if (id === '' || deleting.has(id)) continue
+    survivors.push(id)
+  }
+  if (survivors.length === 0) return false
+
+  const hasProbe = typeof persistence.hasPendingSession === 'function'
+  if (!hasProbe && typeof persistence.stat !== 'function') return true
+  for (const id of survivors) {
     try {
-      if (persistence.hasPendingSession(id)) return true
+      if (hasProbe) {
+        if (persistence.hasPendingSession(id)) return true
+        continue
+      }
+      const snapshot = await persistence.stat(id)
+      if (snapshot === undefined || snapshot.location === undefined) return true
     } catch {
       return true
     }
@@ -946,10 +1035,12 @@ function hasPendingSurvivingSession(ctx, persistence, tree) {
  * `target: { kind, sessionId }` plus `schedule.edit({ action: 'delete' })`.
  *
  * The list is re-read after deletion so a concurrent retarget/creation is not
- * silently missed. Any failure aborts the session deletion before log removal.
+ * silently missed. Any failure aborts the session deletion before log removal;
+ * `removed` still reports reminders already deleted so the caller can disclose
+ * the side effect.
  * @param ctx - Host context; the schedule service is optional.
  * @param sessionIds - Sessions leaving the catalog.
- * @returns the removed count, or an error description.
+ * @returns the removed count, or an error description plus the removed count.
  */
 async function clearSchedules(ctx, sessionIds) {
   const schedule = ctx.get('schedule')
@@ -961,13 +1052,18 @@ async function clearSchedules(ctx, sessionIds) {
     try {
       tasks = await listScheduleTasks(schedule)
     } catch (error) {
-      return { error: `reminder list failed: ${describe(error)}` }
+      return { error: `reminder list failed: ${describe(error)}`, removed }
     }
     const targets = []
     for (const task of tasks) {
       if (task !== null && typeof task === 'object' && task.target === undefined
         && typeof task.sessionId === 'string') {
-        return { error: 'the mounted schedule service uses the unsupported pre-0.2.2 API' }
+        // Legacy records have no explicit target; only one that names a
+        // Session in this tree makes the old API unsafe for this deletion.
+        if (deleting.has(task.sessionId)) {
+          return { error: 'the mounted schedule service uses the unsupported pre-0.2.2 API', removed }
+        }
+        continue
       }
       const targetId = scheduleTargetSessionId(task)
       if (targetId !== undefined && deleting.has(targetId)) targets.push({ task })
@@ -979,7 +1075,7 @@ async function clearSchedules(ctx, sessionIds) {
       try {
         outcome = await deleteScheduleTask(schedule, task)
       } catch (error) {
-        return { error: `reminder "${String(task?.id)}" failed: ${describe(error)}` }
+        return { error: `reminder "${String(task?.id)}" failed: ${describe(error)}`, removed }
       }
       if (outcome === 'deleted') {
         removed += 1
@@ -992,9 +1088,54 @@ async function clearSchedules(ctx, sessionIds) {
         break
       }
     }
-    if (!progress) return { error: 'reminder deletion made no progress' }
+    if (!progress) return { error: 'reminder deletion made no progress', removed }
   }
-  return { error: 'reminders still target the session after retries' }
+  return { error: 'reminders still target the session after retries', removed }
+}
+
+/**
+ * Clear stale registry-global archive and pin entries for deleted Sessions.
+ *
+ * These sets are not pruned by the workspace registry's header refresh, unlike
+ * a Workspace's `sessionIds` account. Both operations are idempotent and stay
+ * best-effort: stale derived state must not turn a completed deletion into an
+ * error. A same-id Session created later would otherwise inherit the archive or
+ * pin state of the deleted lifecycle.
+ * @param ctx - Host context; the workspace registry is optional.
+ * @param sessionIds - Sessions that left the catalog.
+ */
+async function clearWorkspaceSessionState(ctx, sessionIds) {
+  let registry
+  try {
+    registry = ctx.get('workspaceRegistry')
+  } catch {
+    return
+  }
+  if (registry === undefined) return
+  let archived = []
+  let pinned = []
+  try {
+    if (Array.isArray(registry.archivedSessionIds)) archived = registry.archivedSessionIds
+    if (Array.isArray(registry.pinnedSessionIds)) pinned = registry.pinnedSessionIds
+  } catch {
+    return
+  }
+  for (const id of sessionIds) {
+    if (archived.includes(id)) {
+      try {
+        if (typeof registry.unarchiveSession === 'function') await registry.unarchiveSession(id)
+      } catch {
+        /* registry accounting is derived state */
+      }
+    }
+    if (pinned.includes(id)) {
+      try {
+        if (typeof registry.unpinSession === 'function') await registry.unpinSession(id)
+      } catch {
+        /* registry accounting is derived state */
+      }
+    }
+  }
 }
 
 /**
@@ -1084,7 +1225,7 @@ async function deleteProjectionCache(storagesRoot, directory, sessionIds) {
   if (relative(baseInfo.path, realDirectory.path) !== join('session_projcache', 'sessions')) return 0
   let entries
   try {
-    entries = await readdir(directory)
+    entries = await readdir(realDirectory.path)
   } catch {
     return 0
   }
@@ -1093,7 +1234,7 @@ async function deleteProjectionCache(storagesRoot, directory, sessionIds) {
     for (const id of safeIds) {
       if (name !== `${id}.json` && !name.startsWith(`${id}.json.bak.`)) continue
       try {
-        await rm(join(directory, name), { force: true })
+        await rm(join(realDirectory.path, name), { force: true })
         removed += 1
       } catch {
         /* derived cache; ignore */
@@ -1114,7 +1255,9 @@ async function deleteProjectionCache(storagesRoot, directory, sessionIds) {
  * deleting files there could touch another backend's data.
  *
  * The local spill backend exposes `root`; a remote spill backend does not, and
- * its files are left to that backend's retention.
+ * its files are left to that backend's retention. `spillRootIsPrivate` records
+ * that this root is a per-process `dsh-spill-*` temp root, so prior roots must
+ * also be considered when reclaiming one Session's spill files.
  *
  * Derived caches remain under the Harness home: the shipped composition mounts
  * the storage-domain backend at `<home>/storages`.
@@ -1137,16 +1280,21 @@ function resolveLocations(ctx) {
   const attachmentsRoot = typeof attachmentRoot === 'string' && attachmentRoot !== ''
     ? resolve(attachmentRoot)
     : undefined
-  const spillRootValue = ctx?.get?.('spillStore')?.root
+  const spillStore = ctx?.get?.('spillStore')
+  const spillRootValue = spillStore?.root
   const spillRoot = typeof spillRootValue === 'string' && spillRootValue !== ''
     ? resolve(spillRootValue)
     : undefined
+  const spillRootIsPrivate = spillRoot !== undefined
+    && typeof spillStore?.config?.root !== 'string'
+    && basename(spillRoot).startsWith(SPILL_ROOT_PREFIX)
   const storagesRoot = join(home, 'storages')
 
   return {
     sessionRoot,
     attachmentsRoot,
     spillRoot,
+    spillRootIsPrivate,
     storagesRoot,
     projectionCacheRoot: join(storagesRoot, 'session_projcache', 'sessions'),
   }
@@ -1202,15 +1350,19 @@ function startBudget(configured) {
  * absence is an error, never silently "missing".
  * @param root - the sessions root.
  * @param sessionId - exact stored Session id.
+ * @param directoryCache - optional per-request cache of the project listing.
  * @returns the existing Session directories.
  */
-async function findSessionDirectories(root, sessionId) {
-  let projects
-  try {
-    projects = await readdir(root, { withFileTypes: true })
-  } catch (error) {
-    if (isAbsentError(error)) return []
-    throw error
+async function findSessionDirectories(root, sessionId, directoryCache) {
+  let projects = directoryCache?.get(root)
+  if (projects === undefined) {
+    try {
+      projects = await readdir(root, { withFileTypes: true })
+    } catch (error) {
+      if (isAbsentError(error)) return []
+      throw error
+    }
+    directoryCache?.set(root, projects)
   }
   const directories = []
   for (const project of projects) {
@@ -1239,10 +1391,11 @@ async function findSessionDirectories(root, sessionId) {
  */
 async function planSessionDirectories(root, sessionIds, byId) {
   const plans = []
+  const directoryCache = new Map()
   for (const id of sessionIds) {
     let directories
     try {
-      directories = await findSessionDirectories(root, id)
+      directories = await findSessionDirectories(root, id, directoryCache)
     } catch (error) {
       return { code: 'delete-failed', detail: describe(error) }
     }
@@ -1262,11 +1415,20 @@ async function planSessionDirectories(root, sessionIds, byId) {
     const expected = typeof locationPath === 'string' && isAbsolute(locationPath)
       ? resolve(dirname(locationPath))
       : undefined
-    if (expected !== undefined && !samePath(resolve(directory), expected)) {
-      return {
-        code: 'ambiguous',
-        detail: `session "${id}" directory does not match its catalog location`,
-        failed: [{ sessionId: id, code: 'ambiguous', directory, expected }],
+    if (expected !== undefined) {
+      // Compare canonical paths so a case-insensitive host (not only Windows)
+      // does not misclassify the backend's own spelling as a different copy.
+      const [actualDir, expectedDir] = await Promise.all([
+        realpathOrError(directory),
+        realpathOrError(expected),
+      ])
+      if (actualDir.error !== undefined || expectedDir.error !== undefined
+        || !samePath(actualDir.path, expectedDir.path)) {
+        return {
+          code: 'ambiguous',
+          detail: `session "${id}" directory does not match its catalog location`,
+          failed: [{ sessionId: id, code: 'ambiguous', directory, expected }],
+        }
       }
     }
     try {
@@ -1289,17 +1451,58 @@ async function planSessionDirectories(root, sessionIds, byId) {
 async function removeSessionDirectory(root, directory) {
   const rootInfo = await realpathOrError(root)
   if (rootInfo.error !== undefined) throw rootInfo.error
+  const originalInfo = await inspectPath(directory)
+  if (originalInfo.error !== undefined) throw originalInfo.error
+  if (originalInfo.entry === undefined
+    || !originalInfo.entry.isDirectory()
+    || originalInfo.entry.isSymbolicLink()) {
+    throw new Error('refusing to delete a session directory that is no longer a plain directory')
+  }
   const directoryInfo = await realpathOrError(directory)
   if (directoryInfo.error !== undefined) throw directoryInfo.error
   if (!isInside(rootInfo.path, directoryInfo.path)) {
     throw new Error('refusing to delete a directory that resolves outside the session root')
   }
-  const info = await inspectPath(directory)
+  const info = await inspectPath(directoryInfo.path)
   if (info.error !== undefined) throw info.error
   if (info.entry === undefined || !info.entry.isDirectory() || info.entry.isSymbolicLink()) {
     throw new Error('refusing to delete a session directory that is no longer a plain directory')
   }
-  await rm(directory, { recursive: true, force: false, maxRetries: 3, retryDelay: 100 })
+  // Remove the resolved path, not the pre-resolution spelling: a project
+  // directory swapped between realpath() and rm() cannot redirect this call
+  // to a different leaf with the same relative name.
+  await rm(directoryInfo.path, { recursive: true, force: false, maxRetries: 3, retryDelay: 100 })
+}
+
+/**
+ * Resolve every local spill root that can own one deleted Session's locators.
+ *
+ * A local backend configured with an explicit root is stable. The default
+ * root is a per-process `dsh-spill-*` temp directory, so files written by an
+ * earlier process live under a sibling root. Discover those siblings by the
+ * same prefix the backend uses for its startup sweep; an unreadable parent
+ * keeps the current root as the only provable target.
+ * @param locations - resolved store roots.
+ * @returns the roots to inspect, or undefined when no local spill root exists.
+ */
+async function resolveSpillRoots(locations) {
+  const root = locations.spillRoot
+  if (root === undefined) return undefined
+  if (locations.spillRootIsPrivate !== true) return [root]
+  const parent = dirname(root)
+  let entries
+  try {
+    entries = await readdir(parent, { withFileTypes: true })
+  } catch {
+    return [root]
+  }
+  const roots = new Set([root])
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+    if (!entry.name.startsWith(SPILL_ROOT_PREFIX)) continue
+    roots.add(join(parent, entry.name))
+  }
+  return [...roots]
 }
 
 /**
@@ -1309,16 +1512,18 @@ async function removeSessionDirectory(root, directory) {
  * Spill locators are file paths inside the owning Session's spill directory.
  * Forked or spawned descendants inherit the parent's events and may keep using
  * those paths, so a surviving descendant keeps every deleted tree's spill files
- * rather than risking a broken locator. Non-local spill backends expose no
- * `root`; their retention policy owns cleanup.
- * @param root - resolved spill root, when the backend exposes one.
- * @param byId - catalog snapshots keyed by Session id.
+ * rather than risking a broken locator. Current DSH ordinary forks carry only
+ * `isSeeded`, not `parentSession`; any surviving seeded Session is therefore
+ * treated as a possible fork source. Non-local spill backends expose no `root`;
+ * their retention policy owns cleanup.
+ * @param roots - resolved local spill roots, or undefined when unavailable.
+ * @param byId - refreshed catalog snapshots keyed by Session id.
  * @param sessionIds - Sessions whose directories are gone.
- * @param catalog - the stored-directory catalog; an incomplete catalog keeps all.
+ * @param catalog - the refreshed stored-directory catalog; incomplete keeps all.
  * @returns counts, or undefined when no local spill root is available.
  */
-async function deleteSpillDirectories(root, byId, sessionIds, catalog) {
-  if (root === undefined) return undefined
+async function deleteSpillDirectories(roots, byId, sessionIds, catalog) {
+  if (roots === undefined || roots.length === 0) return undefined
   if (catalog === undefined || catalog.incomplete === true
     || catalog.unaccounted.length > 0 || catalog.duplicates.length > 0) {
     return { deleted: 0, kept: sessionIds.length, failed: 0, status: 'unverified' }
@@ -1326,36 +1531,48 @@ async function deleteSpillDirectories(root, byId, sessionIds, catalog) {
   if (hasSurvivingDescendant(byId, new Set(sessionIds))) {
     return { deleted: 0, kept: sessionIds.length, failed: 0 }
   }
-  const rootInfo = await realpathOrError(root)
-  if (rootInfo.error !== undefined) {
-    return isAbsentError(rootInfo.error)
-      ? { deleted: 0, kept: 0, failed: 0 }
-      : { deleted: 0, kept: 0, failed: 0, status: 'unavailable' }
+
+  const resolvedRoots = []
+  for (const root of roots) {
+    const rootInfo = await realpathOrError(root)
+    if (rootInfo.error !== undefined) {
+      if (isAbsentError(rootInfo.error)) continue
+      return { deleted: 0, kept: sessionIds.length, failed: 0, status: 'unavailable' }
+    }
+    const info = await inspectPath(rootInfo.path)
+    if (info.error !== undefined || info.entry === undefined || !info.entry.isDirectory()) {
+      return { deleted: 0, kept: sessionIds.length, failed: 0, status: 'unavailable' }
+    }
+    if (!resolvedRoots.includes(rootInfo.path)) resolvedRoots.push(rootInfo.path)
   }
+  if (resolvedRoots.length === 0) return { deleted: 0, kept: 0, failed: 0 }
+
   let deleted = 0
   let failed = 0
-  for (const id of sessionIds) {
-    const directory = join(root, spillSessionKey(id))
-    const info = await inspectPath(directory)
-    if (info.error !== undefined) {
-      failed += 1
-      continue
-    }
-    if (info.entry === undefined) continue
-    if (!info.entry.isDirectory() || info.entry.isSymbolicLink()) {
-      failed += 1
-      continue
-    }
-    const realDirectory = await realpathOrError(directory)
-    if (realDirectory.error !== undefined || !isInside(rootInfo.path, realDirectory.path)) {
-      failed += 1
-      continue
-    }
-    try {
-      await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
-      deleted += 1
-    } catch {
-      failed += 1
+  for (const root of resolvedRoots) {
+    for (const id of sessionIds) {
+      const directory = join(root, spillSessionKey(id))
+      const info = await inspectPath(directory)
+      if (info.error !== undefined) {
+        failed += 1
+        continue
+      }
+      if (info.entry === undefined) continue
+      if (!info.entry.isDirectory() || info.entry.isSymbolicLink()) {
+        failed += 1
+        continue
+      }
+      const realDirectory = await realpathOrError(directory)
+      if (realDirectory.error !== undefined || !isInside(root, realDirectory.path)) {
+        failed += 1
+        continue
+      }
+      try {
+        await rm(realDirectory.path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+        deleted += 1
+      } catch {
+        failed += 1
+      }
     }
   }
   return { deleted, kept: 0, failed }
@@ -1363,13 +1580,20 @@ async function deleteSpillDirectories(root, byId, sessionIds, catalog) {
 
 /**
  * Whether any surviving Session descends from the deleted tree.
- * @param byId - catalog snapshots keyed by Session id.
+ *
+ * Parent-chain descent covers subagent children. It does not cover current
+ * ordinary forks, which intentionally omit `parentSession`; a surviving
+ * `isSeeded` Session is therefore an unprovable potential fork source and
+ * keeps spill files. Keeping extra spill files is safe; deleting a locator a
+ * fork inherited is not.
+ * @param byId - refreshed catalog snapshots keyed by Session id.
  * @param deleted - deleted Session ids.
- * @returns true when a surviving header's parent chain reaches a deleted id.
+ * @returns true when a surviving Session may descend from a deleted id.
  */
 function hasSurvivingDescendant(byId, deleted) {
   for (const [id, snapshot] of byId) {
     if (deleted.has(id)) continue
+    if (snapshot?.header?.isSeeded === true) return true
     let parent = String(snapshot?.header?.parentSession ?? '')
     const seen = new Set([id])
     for (let depth = 0; parent !== '' && depth < MAX_TREE_DEPTH; depth += 1) {
@@ -1409,6 +1633,21 @@ function assertContained(root, directory) {
 }
 
 /**
+ * Carry the number of already-removed reminders on a later failure.
+ *
+ * Reminder removal is necessarily ordered before log removal; if a later
+ * liveness check or a directory delete fails, the logs stay but the reminders
+ * are already gone. Report that side effect instead of leaving it silent.
+ * @param result - failure result.
+ * @param count - reminders removed before the failure.
+ * @returns the same result with `schedules` when non-zero.
+ */
+function withSchedulesRemoved(result, count) {
+  if (count > 0) result.schedules = count
+  return result
+}
+
+/**
  * Build one failure result.
  * @param code - stable machine-readable failure code.
  * @param sessionId - the addressed Session, when the request named one.
@@ -1441,6 +1680,7 @@ function statusFor(result) {
     case 'live':
     case 'ambiguous':
     case 'directory-missing':
+    case 'subagent-session':
       return 409
     case 'unsupported':
       return 501

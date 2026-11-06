@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
     const zh = {
       'menu.delete': '删除会话',
       'dialog.title': '永久删除会话？',
-      'dialog.description': '将永久删除「{title}」及其所有子会话的存储日志。',
+      'dialog.description': '将永久删除「{title}」及其所有 subagent 子会话的存储日志；fork 出来的会话不会被删除。',
       'dialog.warning': '此操作无法撤销。会话日志会被删除；附件默认一并清理，仍被其他会话引用的会保留。',
       'dialog.attachments': '同时删除附件',
       'dialog.attachmentsHint': '只删除不再被其他会话引用的附件；仍被引用的附件会保留，附件缓存不清理。',
@@ -30,9 +30,11 @@ window.__ModuleLoader__.load({
       'dialog.attachmentsSummaryNone': '附件：没有需要清理的附件。',
       'dialog.attachmentsSummaryKept': '{n} 个附件仍被其他会话引用，已保留。',
       'dialog.attachmentsSummaryFailed': '{n} 个附件未能删除，仍留在磁盘上。',
+      'dialog.attachmentsSummaryStaging': '另清理了 {n} 个过期暂存文件。',
       'dialog.attachmentsUnverified': '未能核对全部会话目录或附件引用，所有附件均已保留。',
       'dialog.spillFailed': '{n} 个会话的 spill 文件未能删除，仍留在磁盘上。',
       'dialog.spillUnverified': '会话目录或 spill 引用核对不完整，spill 文件已保留。',
+      'dialog.remindersRemoved': '删除日志前已移除 {n} 条提醒；这些提醒不会自动恢复。',
       'dialog.untitled': '未命名会话',
       'dialog.cancel': '取消',
       'dialog.confirm': '永久删除',
@@ -54,6 +56,8 @@ window.__ModuleLoader__.load({
       'error.ambiguous': '会话目录与 catalog 不一致，或同一 ID 存在多个目录；为避免删错，已拒绝删除。',
       'error.scheduleFailed': '无法删除绑定在该会话上的提醒；会话文件没有改动。',
       'error.liveCheckFailed': '无法确认会话是否仍在运行；为安全起见已拒绝删除。',
+      'error.subagentSession': 'subagent 子会话不能单独删除；请删除它的父会话。',
+      'error.listFailed': '无法读取已存储的会话列表，删除已取消。',
       'error.timeout': '删除请求超时；请刷新页面确认实际结果。',
       'error.network': '无法连接到本地 Harness 服务。',
       'error.http': '删除请求失败（HTTP {status}）。',
@@ -62,7 +66,7 @@ window.__ModuleLoader__.load({
     const en = {
       'menu.delete': 'Delete session',
       'dialog.title': 'Delete this session permanently?',
-      'dialog.description': 'Permanently deletes the stored log of "{title}" and of all its sub-sessions.',
+      'dialog.description': 'Permanently deletes the stored log of "{title}" and of all its subagent sub-sessions. Forked sessions are not deleted.',
       'dialog.warning': 'This cannot be undone. Session logs are deleted; attachments are cleaned up too unless you clear the option below.',
       'dialog.attachments': 'Also delete attachments',
       'dialog.attachmentsHint': 'Deletes only attachments no other session references. Shared attachments are kept; the attachment cache is not cleared.',
@@ -71,9 +75,11 @@ window.__ModuleLoader__.load({
       'dialog.attachmentsSummaryNone': 'Attachments: there was nothing to clean up.',
       'dialog.attachmentsSummaryKept': '{n} attachments are still referenced by other sessions and were kept.',
       'dialog.attachmentsSummaryFailed': '{n} attachments could not be deleted and remain on disk.',
+      'dialog.attachmentsSummaryStaging': 'Also removed {n} abandoned staging files.',
       'dialog.attachmentsUnverified': 'Session directories or attachment references could not all be verified, so every attachment was kept.',
       'dialog.spillFailed': '{n} session spill file groups could not be deleted and remain on disk.',
       'dialog.spillUnverified': 'Session directories or spill references could not be fully verified, so spill files were kept.',
+      'dialog.remindersRemoved': 'Removed {n} reminders before deleting the logs; those reminders will not be restored.',
       'dialog.untitled': 'Untitled session',
       'dialog.cancel': 'Cancel',
       'dialog.confirm': 'Delete permanently',
@@ -95,6 +101,8 @@ window.__ModuleLoader__.load({
       'error.ambiguous': 'The session directory does not match the catalog, or the id has multiple directories; deletion was refused to avoid removing the wrong data.',
       'error.scheduleFailed': 'The reminders bound to this session could not be removed; no session files were changed.',
       'error.liveCheckFailed': 'Liveness could not be determined, so deletion was refused.',
+      'error.subagentSession': 'A subagent sub-session cannot be deleted on its own; delete its parent session instead.',
+      'error.listFailed': 'The stored session list could not be read, so deletion was cancelled.',
       'error.timeout': 'The delete request timed out; refresh the page to confirm what happened.',
       'error.network': 'Could not reach the local Harness service.',
       'error.http': 'The delete request failed (HTTP {status}).',
@@ -186,6 +194,8 @@ window.__ModuleLoader__.load({
         code: typeof data?.code === 'string' ? data.code : 'http',
         status: response.status,
         message: typeof data?.message === 'string' ? data.message : '',
+        ...(typeof data?.reason === 'string' ? { reason: data.reason } : {}),
+        ...(typeof data?.schedules === 'number' && data.schedules > 0 ? { schedules: data.schedules } : {}),
       }
     }
 
@@ -215,6 +225,10 @@ window.__ModuleLoader__.load({
           return t('error.scheduleFailed')
         case 'live-check-failed':
           return t('error.liveCheckFailed')
+        case 'subagent-session':
+          return t('error.subagentSession')
+        case 'list-failed':
+          return t('error.listFailed')
         case 'timeout':
           return t('error.timeout')
         case 'network':
@@ -263,6 +277,9 @@ window.__ModuleLoader__.load({
       }
       if (report.kept > 0) {
         parts.push(t('dialog.attachmentsSummaryKept', { n: String(report.kept) }))
+      }
+      if (typeof report.staging === 'number' && report.staging > 0) {
+        parts.push(t('dialog.attachmentsSummaryStaging', { n: String(report.staging) }))
       }
       if (parts.length === 0) {
         parts.push(report.missing > 0 ? t('dialog.attachmentsSummaryGone') : t('dialog.attachmentsSummaryNone'))
@@ -360,7 +377,12 @@ window.__ModuleLoader__.load({
             option,
             current.error === null
               ? null
-              : h('p', { key: 'error', className: 'dsh-session-delete__error', role: 'alert' }, errorText(current.error, t)),
+              : h(React.Fragment, { key: 'error' },
+                  h('p', { key: 'message', className: 'dsh-session-delete__error', role: 'alert' }, errorText(current.error, t)),
+                  typeof current.error.schedules === 'number' && current.error.schedules > 0
+                    ? h('p', { key: 'reminders', className: 'dsh-session-delete__warning', role: 'status' },
+                        t('dialog.remindersRemoved', { n: String(current.error.schedules) }))
+                    : null),
           ]
 
       return h(Modal, {
@@ -445,6 +467,13 @@ window.__ModuleLoader__.load({
       // The built-in archive action is a footer (afterContent) contribution at
       // order 600; order 700 with afterContent places this directly after it.
       const t = ctx.locale.bind(NS)
+      // remoteAccess is optional: a profile without it keeps the legacy
+      // local-only action, while a shared Web peer is gated before rendering.
+      const accessSource = (sessionId) => ctx.get?.('remoteAccess')?.source?.('session', sessionId, 'session/delete')
+      const canDelete = (sessionId) => {
+        const source = accessSource(sessionId)
+        return source === undefined ? true : source.getSnapshot()
+      }
       ctx.slots.inject('contextMenu.icon', () => ctx.slots.register({
         name: 'contextMenu.icon',
         key: 'session-delete.trash',
@@ -454,15 +483,18 @@ window.__ModuleLoader__.load({
         id: 'session-delete.menu',
         target: 'session',
         order: 700,
-        observe: () => [ctx.locale],
-        resolve: ({ sessionId, displayTitle }) => [{
+        observe: ({ sessionId }) => {
+          const source = accessSource(sessionId)
+          return source === undefined ? [ctx.locale] : [ctx.locale, source]
+        },
+        resolve: ({ sessionId, displayTitle }) => canDelete(sessionId) ? [{
           id: 'delete',
           label: t('menu.delete'),
           icon: { key: 'session-delete.trash' },
           danger: true,
           afterContent: true,
           run: () => requestDelete(sessionId, displayTitle),
-        }],
+        }] : [],
       }), 'session-delete: session menu action')
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({

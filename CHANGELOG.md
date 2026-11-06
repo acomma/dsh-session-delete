@@ -14,17 +14,27 @@
 - reminder 删除使用 `expectedUpdatedAt`，冲突时重新读取；列表读不到或任务删不掉时 fail-closed，不再静默成功。
 - live 检查支持异步作业查询；作业注册表查询失败返回 `live-check-failed`，不再当作「没有任务」。删除前、读取引用后、清除 reminder 后各检查一次。
 - 会话/附件/spill 根必须由挂载服务暴露；没有 `root` 的非 JSONL/非本地后端返回 `unsupported` 或 `attachments.status = "unverified"`，不再回退到默认目录。
-- 本地 spill 目录按 `session-<sha256(id)[0:12]>` 清理；存在仍从该树派生的 fork/subagent 时整体保留，catalog 不完整时也保留。
+- 本地 spill 目录按 `session-<sha256(id)[0:12]>` 清理；存在仍从该树派生的 fork/subagent 或任何存活 `isSeeded` 会话时整体保留，catalog 不完整时也保留。
 - `tmp`、projection cache 和 spill 目录增加 `realpath`/符号链接包含检查；`realpath` 的权限错误不再误报为「对象不存在」。
 - 幸存的 live 会话日志仍未 materialize（pending）时，其内存中的附件引用无法读取，附件清理返回 `unverified` 并保留全部对象。
 - 附件预算覆盖「读取待删会话」与「核对保留会话」两段，统一用 `reason = "timeout"` 报告超时。
 - 后端返回不推进或跳过 offset 的批次时立即失败，不再死循环/漏读。
-- 删除前把会话目录与 `sessionPersistence.list()` 对账：出现 catalog 之外的目录、或同一 id 落在两个项目目录下时，放弃附件清理（`reason = "catalog"`）。`list()` 会跳过读不了 header 的会话，这类目录正由此兜住。
+- 删除后把会话目录与 `sessionPersistence.list()` 对账：出现 catalog 之外的目录、或同一 id 落在两个项目目录下时，放弃附件清理（`reason = "catalog"`）。`list()` 会跳过读不了 header 的会话，这类目录正由此兜住。
 - 删除对象前用 `realpath` 确认父目录仍在附件仓库内；符号链接、类型不符与非「不存在」的 `lstat` 错误计入 `failed`。
 - 部分对象删除失败时报告 `attachments.status = "partial"`；客户端摘要在全部保留时不再输出「没有需要清理的附件」，并显示 spill 删除失败/未核对。
 - 每次清理顺带删除 `attachments/v1/tmp` 中超过 7 天的暂存残留（通用文件没有大小上限，窗口放宽）。
 - 客户端超时覆盖响应体读取；请求中止返回 `timeout` 而不是 `network`。
-- 测试从 16 项扩展到 53 项，覆盖上述边界。
+- 客户端错误结果保留 Host 的 `reason`，运行中 job 现在显示“先停止后台任务”而不是“重启 Harness”；补齐 `list-failed`、`subagent-session` 文案和 `dialog.remindersRemoved` 提示。
+- 客户端在显示删除菜单项前用 `ctx.remoteAccess.source('session', id, 'session/delete')` 门控；非 owner 没有对应 grant 时不显示。
+- 确认框文案改为“subagent 子会话”，明确普通 fork 不会被删除；成功摘要显示 `attachments.staging`。
+- 删除后重新 `list()`/扫描 catalog，覆盖删除期间新建的 fork 或未知目录；普通 fork 只写 `isSeeded`，spill 清理对任何存活 `isSeeded` 会话保守保留。
+- 默认 spill root 是进程级 `dsh-spill-*` 临时目录；清理时同时检查同一父目录下的历史 root，配置了 `config.root` 时只清理该 root。
+- pending 探测在 backend 没有 `hasPendingSession()` 时退回公开的 `stat()` snapshot；存活会话的附件引用同时扫描其内存 `snapshotEvents()`，覆盖 write-behind 缓冲。
+- catalog 在删除后检查，且把“只有子目录”的未知会话目录也视为 artifact；目录/附件/spill 删除尽量使用 `realpath` 后的路径。
+- 拒绝把 `origin: 'subagent'` 的子会话作为删除根，避免父 Session 的 subagent catalog 悬空；无关的旧 schedule 记录不再阻止删除。
+- 成功删除后尽力清除 Workspace registry 的 `archivedSessionIds` / `pinnedSessionIds`。
+- `engines.dsh` 收紧到 `>=0.2.2-rc.1 <0.2.3-0`，避免在未验证的 0.2.3 布局上删除文件。
+- 测试从 53 项扩展到 71 项，新增 Host 边界用例和独立 Client harness。
 
 ## 1.0.0
 
