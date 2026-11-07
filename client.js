@@ -46,6 +46,7 @@ window.__ModuleLoader__.load({
       'error.live': '该会话已被 DSH 在后台激活：打开过一次的会话会预热一个 Agent，并持有日志的写入句柄；Host 进程内没有释放入口。请重启 Harness 后再删除（刷新页面无效）。',
       'error.liveWriter': '该会话仍被另一个进程或未释放的写入句柄持有；请关闭该进程/句柄后再删除。',
       'error.liveActivity': 'DSH 的 workspace 活动检查仍报告该会话有活动；请先停止相关工作再删除。',
+      'error.busy': '该会话已有一个删除请求正在执行，请等待它完成后再试。',
       'error.liveJob': '该会话还有运行中的后台任务，请先停止它们再删除。',
       'error.not-found': '该会话不存在或已被删除。',
       'error.invalid-id': '会话 ID 无效。',
@@ -94,6 +95,7 @@ window.__ModuleLoader__.load({
       'error.live': 'DSH activated this session in the background: opening a session once pre-warms an Agent that holds the log write handle, and the Host process exposes no way to release it. Restart Harness, then delete it (reloading the page does not help).',
       'error.liveWriter': 'This session is still held by another process or an unreleased write handle. Close that process or handle, then delete it.',
       'error.liveActivity': 'DSH still reports workspace activity for this session. Stop that work before deleting it.',
+      'error.busy': 'A deletion request for this session is already running; wait for it to finish and try again.',
       'error.liveJob': 'This session still has running background jobs. Stop them before deleting it.',
       'error.not-found': 'This session does not exist or was already deleted.',
       'error.invalid-id': 'The session id is invalid.',
@@ -127,6 +129,8 @@ window.__ModuleLoader__.load({
       attachments: null,
       /** Spill cleanup report of the last successful deletion, when one ran. */
       spill: null,
+      /** Reminders removed before the deletion, shown after success too. */
+      schedules: 0,
     })
     /** One pending confirmation, shared by the menu row and the overlay dialog. */
     let state = CLOSED
@@ -206,6 +210,8 @@ window.__ModuleLoader__.load({
         message: typeof data?.message === 'string' ? data.message : '',
         ...(typeof data?.reason === 'string' ? { reason: data.reason } : {}),
         ...(typeof data?.schedules === 'number' && data.schedules > 0 ? { schedules: data.schedules } : {}),
+        ...(data?.attachments === undefined ? {} : { attachments: data.attachments }),
+        ...(data?.spill === undefined ? {} : { spill: data.spill }),
       }
     }
 
@@ -221,6 +227,8 @@ window.__ModuleLoader__.load({
                 : t('error.liveActivity')
         case 'not-found':
           return t('error.not-found')
+        case 'busy':
+          return t('error.busy')
         case 'invalid-id':
           return t('error.invalid-id')
         case 'invalid-request':
@@ -345,6 +353,7 @@ window.__ModuleLoader__.load({
             error: null,
             attachments: result.data?.attachments ?? null,
             spill: result.data?.spill ?? null,
+            schedules: typeof result.data?.schedules === 'number' ? result.data.schedules : 0,
           })
           return
         }
@@ -388,8 +397,19 @@ window.__ModuleLoader__.load({
 
       const summary = success ? attachmentSummary(current.attachments, t) : null
       const spillWarning = success ? spillSummary(current.spill, t) : null
+      const errorAttachments = !success && current.error !== null
+        ? attachmentSummary(current.error.attachments, t)
+        : null
+      const errorSpill = !success && current.error !== null
+        ? spillSummary(current.error.spill, t)
+        : null
+      const reminderNotice = success && current.schedules > 0
+        ? h('p', { key: 'schedules', className: 'dsh-session-delete__body' }, t('dialog.remindersRemoved', {
+            n: String(current.schedules),
+          }))
+        : null
       const body = success
-        ? [summary, spillWarning].filter((item) => item !== null)
+        ? [summary, spillWarning, reminderNotice].filter((item) => item !== null)
         : [
             h('p', { key: 'warning', className: 'dsh-session-delete__warning' }, t('dialog.warning')),
             option,
@@ -401,7 +421,9 @@ window.__ModuleLoader__.load({
                     ? h('p', { key: 'reminders', className: 'dsh-session-delete__warning', role: 'status' },
                         t('dialog.remindersRemoved', { n: String(current.error.schedules) }))
                     : null),
-          ]
+            errorAttachments,
+            errorSpill,
+          ].filter((item) => item !== null)
 
       return h(Modal, {
         open: true,

@@ -30,7 +30,7 @@
 
    ```powershell
    npm pack
-   dsh plugin --profile release-smoke add (Resolve-Path .\acomma-dsh-session-delete-1.0.0.tgz)
+   dsh plugin --profile release-smoke add (Resolve-Path .\acomma-dsh-session-delete-1.0.1.tgz)
    dsh --profile release-smoke --dump-config | Select-String 'session-delete'
    ```
 
@@ -130,14 +130,14 @@ npm publish --tag next --access public
 1. 打 tag 并推送：
 
    ```powershell
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v1.0.1
+   git push origin v1.0.1
    ```
 
 2. 在 GitHub Release 中附上 `npm pack` 生成的 `.tgz`，并写 SHA256：
 
    ```powershell
-   Get-FileHash .\acomma-dsh-session-delete-1.0.0.tgz -Algorithm SHA256
+   Get-FileHash .\acomma-dsh-session-delete-1.0.1.tgz -Algorithm SHA256
    ```
 
 3. Release notes 至少包含：支持的 DSH 版本、删除行为、是否默认清理附件、升级方式。

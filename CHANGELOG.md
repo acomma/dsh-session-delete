@@ -1,12 +1,26 @@
 # Changelog
 
-## Unreleased
+## 1.0.1
+
+- 树完整性预检把 `origin: 'subagent'` 的空 `parentSession` 和父链环同样视为不可解析，避免删除根后留下无法再删除的孤儿子会话；spill 幸存判断对空链/环也保守保留。
+- 子目录已删除但根目录失败时，继续清理已删子树的投影缓存、spill、附件和 workspace 状态，再返回 `partial`；此前这些引用会因日志消失而永久泄漏。
+- catalog 目录匹配按平台规则处理 Windows 大小写和 macOS Unicode 归一化；计划目录名必须等于 `encodeSegment(id)`，删除前再次复核。
+- projection cache 在未挂载 `storage` 服务或无法确认 JSON backend root 时跳过，不再猜测 `<DSH_HOME>/storages`；会话根优先使用 backend 已解析的 `root`。
+- pending 附件核对改为逐快照判断：只有没有 `location` 且后端报告 pending 的幸存会话才保留全部附件；空白 live 草稿不再单独阻止清理，且 live `snapshotEvents()` 继续合并。
+- 配置的 spill root 也执行所有权/权限检查；不信任时返回 `unverified` 并保留。
+- 同一会话的并发删除在 Host 进程内返回 `busy`，客户端显示明确提示；不同 id 的派生清理在进程内串行执行，避免并发删除共享附件时双方都保留对象。根目录在删除前被另一个进程删掉时，校验后返回 `not-found` 而不是误报 `partial`。
+- pending 探测在 backend 既无 `hasPendingSession()` 也无 `stat()` 时改为 fail-closed，按未知 pending 保留附件。
+- 合并 `inspectCatalog()` 的重复 `unaccounted` 数组并记录失败 project，去掉 `ensureTreeCatalogComplete()` 的重复 `readdir()`；附件核对复用已刷新的 snapshot。
+- 成功删除时也显示已移除的 reminder 数量；schedule 分页在缺少 `total` 时继续读到空页。
+- 每个会话目录真正删除前，用 `sessionPersistence.stat(id)` 复核 materialized location 仍指向计划目录；目录名之外也覆盖 plan→rm 之间的日志替换。
+- partial 删除的客户端错误视图现在显示已删子树的附件/spill 清理摘要，不再只显示泛化的“部分失败”。
+- 测试从 87 项扩展到 104 项（Host 92 + Client 12；Windows 上 2 项 POSIX 用例跳过），补充空/环父链、部分清理（根/中间子会话失败）、Windows 大小写、无 storage 服务、配置 spill root、并发 busy、并发已删根的 not-found、无 `total` 分页、materialized location 复核、无 pending 探测、partial 客户端摘要和成功提醒用例。
 
 修复删除正确性、兼容性、路径边界与报告问题，并按 `deepseek-harness` 源码对齐 Host API：
 
 - 不再对 Session id 做 `trim`/字符集限制：id 原样使用，通过 JSONL 的 `encodeSegment` 进入路径；支持空格、非 ASCII 与长 id。投影缓存只处理 storage-json 接受的 key。
 - 删除前先从 snapshot 的 `location.path` 直接解析权威目录（没有 location 才扫描项目目录）；同一 id 出现多个目录，或扫描目录与 catalog location 不一致时返回 `ambiguous` 并拒绝删除。
-- 删除前增加树完整性预检：根会话所在 project 出现 catalog 无法命名的会话目录、出现 `parentSession` 不在 catalog 中的 subagent 会话，或某个 subagent 的父链落在目标树内却未被纳入删除树（例如中间会话缺少 `origin`）时返回 `tree-incomplete` 并拒绝删除，避免 `list()` 跳过不可读子会话后留下孤儿子会话。
+- 删除前增加树完整性预检：根会话所在 project 出现 catalog 无法命名的会话目录、出现 `parentSession` 不在 catalog 中/为空/成环的 subagent 会话，或某个 subagent 的父链落在目标树内却未被纳入删除树（例如中间会话缺少 `origin`）时返回 `tree-incomplete` 并拒绝删除，避免 `list()` 跳过不可读子会话后留下孤儿子会话。
 - 子会话按深度优先删除、根会话最后删；任一子目录失败后立即停止，不再删除失败节点的祖先，重试仍可沿父链继续。已缺失的子目录按已删除处理。
 - 移除 64 层 lineage 截断：subagent 链可以超过旧上限，删除与 spill 幸存判断不再静默截断。
 - 根目录缺失仍返回 `directory-missing`；不再由非根目录的缺失误报 `partial`。
@@ -15,8 +29,8 @@
 - `engines.dsh` 下限提升到 `0.2.2-rc.1`，不再兼容旧的 `sessionId`/`delete` schedule 模型。
 - reminder 删除使用 `expectedUpdatedAt`，冲突时重新读取；列表读不到或任务删不掉时 fail-closed，不再静默成功。
 - live 检查支持异步作业查询；作业注册表查询失败返回 `live-check-failed`，不再当作「没有任务」。删除前、读取引用后、清除 reminder 后各检查一次；并扫描所有 live Agent/Session 的 subagent 祖先链，覆盖未进入 catalog 的 pending 子会话。清除 reminder 后还会询问 `workspace/session-activity` waterfall，覆盖自定义 activity provider。
-- 对已 materialize 的 tree 会话做 `open(id, 'write')` 短探测；另一个进程持有写租约时返回 `live` / `reason = "writer"`。tree 的 `migration-required` 日志允许探测（可能先发布 migration，随后删除；删除失败则留下已迁移但完整的会话）。附件核对时对非本进程 live 的 current 幸存会话也做同样探测，忙时保留全部附件；幸存会话的 migration-required/未知格式不做写打开，直接保留全部附件（`reason = "writer"`）；幸存会话 pending 仍无法探测。
-- 会话根优先取公开的 `config.root`；附件根取 `attachments.root`；spill 根取 `spillStore.root`，没有根的 backend 不会被猜成默认目录。
+- 对已 materialize 的 tree 会话做 `open(id, 'write')` 短探测；另一个进程持有写租约时返回 `live` / `reason = "writer"`。tree 的 `migration-required` 日志允许探测（可能先发布 migration，随后删除；删除失败则留下已迁移但完整的会话）。附件核对时对非本进程 live 的 current 幸存会话也做同样探测，忙时保留全部附件；幸存会话的 migration-required/未知格式不做写打开，直接保留全部附件（`reason = "writer"`）；幸存会话 pending 按快照逐项检测。
+- 会话根优先取 backend 已解析的 `root`；附件根取 `attachments.root`；spill 根取 `spillStore.root`，没有根的 backend 不会被猜成默认目录。
 - 本地 spill 目录按 `session-<sha256(id)[0:12]>` 清理；兄弟 root 只匹配 `dsh-spill-` 加 6 位字母数字的精确形状，并在 POSIX 上检查 root/祖先的所有权与权限。存在仍从该树派生的 fork/subagent、父链无法解析的幸存 subagent，或存活 `isSeeded` 会话时整体保留，catalog 不完整时也保留。
 - `tmp`、projection cache、session 目录和 spill 目录增加 strict-descendant/精确父目录/符号链接检查；`realpath` 的权限错误不再误报为「对象不存在」。
 - 幸存的 live 会话日志仍未 materialize（pending）时，其内存中的附件引用无法读取，附件清理返回 `unverified` 并保留全部对象。

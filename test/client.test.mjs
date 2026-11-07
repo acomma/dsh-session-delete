@@ -382,6 +382,55 @@ test('warns when reminders were removed before a later failure', async () => {
   assert.match(textOf(renderDialog(harness, t)), /Removed 2 reminders/)
 })
 
+test('shows reminders removed on a successful deletion', async () => {
+  const harness = makeHarness()
+  const { context } = applyClient(harness)
+  const action = harness.menu.resolve({ sessionId: 'session-a', displayTitle: 'A' })[0]
+  await action.run()
+  const t = translatorFor(harness, 'session-delete')
+  context.fetch = async () => response({
+    ok: true,
+    sessionId: 'session-a',
+    deleted: ['session-a'],
+    schedules: 2,
+  })
+  await confirmButton(renderDialog(harness, t), harness.Button, t).props.onClick()
+  assert.match(textOf(renderDialog(harness, t)), /Removed 2 reminders/)
+})
+
+test('maps busy to a localized message', async () => {
+  const harness = makeHarness()
+  const { context } = applyClient(harness)
+  const action = harness.menu.resolve({ sessionId: 'session-a', displayTitle: 'A' })[0]
+  await action.run()
+  const t = translatorFor(harness, 'session-delete')
+  context.fetch = async () => response({ ok: false, code: 'busy', message: 'host message' }, 409)
+  await confirmButton(renderDialog(harness, t), harness.Button, t).props.onClick()
+  assert.match(textOf(renderDialog(harness, t)), /already running/)
+  assert.doesNotMatch(textOf(renderDialog(harness, t)), /host message/)
+})
+
+test('shows the cleanup report on a partial deletion', async () => {
+  const harness = makeHarness()
+  const { context } = applyClient(harness)
+  const action = harness.menu.resolve({ sessionId: 'session-a', displayTitle: 'A' })[0]
+  await action.run()
+  const t = translatorFor(harness, 'session-delete')
+  context.fetch = async () => response({
+    ok: false,
+    code: 'partial',
+    sessionId: 'session-a',
+    deleted: ['session-child'],
+    failed: [{ sessionId: 'session-a', code: 'delete-failed' }],
+    schedules: 0,
+    attachments: { status: 'applied', deleted: 1, kept: 0, failed: 0, missing: 0, bytes: 9, staging: 0 },
+  }, 500)
+  await confirmButton(renderDialog(harness, t), harness.Button, t).props.onClick()
+  const text = textOf(renderDialog(harness, t))
+  assert.match(text, /Some files could not be deleted/)
+  assert.match(text, /Attachments: 1 deleted, 9 B freed/)
+})
+
 test('registers identical English and Chinese dictionary key sets', () => {
   const harness = makeHarness()
   applyClient(harness)

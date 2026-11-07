@@ -21,7 +21,6 @@
  */
 import { createHash } from 'node:crypto'
 import { lstat, readdir, realpath, rm } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 /** Absolute Fetch path; the browser calls the document-relative `api/session.delete`. */
@@ -43,10 +42,15 @@ const REFERENCE_SCAN_BUDGET_MS = 30000
 const STAGING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 /** Exact `mkdtemp` shape of a default spill root: prefix plus six alphanumeric characters. */
 const SPILL_ROOT_NAME = /^dsh-spill-[A-Za-z0-9]{6}$/u
+/** In-process guard against overlapping deletion requests for one Session id. */
+const inflightDeletions = new Set()
+/** Serializes derived cleanup across different Session ids in this process. */
+let cleanupTail = Promise.resolve()
 
 const FAILURE_MESSAGES = {
   'invalid-request': 'Expected a JSON body with a sessionId string.',
   'invalid-id': 'The session id must be a non-empty string.',
+  busy: 'Another deletion request is already running for this session.',
   unavailable: 'Session persistence is not mounted in this profile.',
   unsupported: 'This session backend has no resolved filesystem root; deletion is unsupported.',
   'not-found': 'No stored session has that id.',
@@ -107,21 +111,24 @@ async function respond(ctx, request) {
 /**
  * Permanently delete one stored Session and its subagent descendants.
  *
- * Order: resolve the stored tree, refuse a subagent root or anything live, read
- * the attachment references while the logs still exist, plan every deletion
- * target from the catalog-resolved location, re-check liveness, clear reminders,
- * re-check liveness once more, remove child directories before the root, then
- * re-scan the catalog and remove derived caches, spill files, and unshared
- * attachment objects.
+ * Order: resolve the stored tree, refuse a subagent root or anything live,
+ * resolve the catalog directories and prove the tree catalog is complete, probe
+ * cross-process writers, read attachment references while the logs still exist,
+ * re-check liveness, clear reminders, re-check liveness once more, remove child
+ * directories before the root, then re-scan the catalog and remove derived
+ * caches, spill files, and unshared attachment objects.
  *
  * The root directory is removed last so a child failure leaves the root and a
  * retry can finish the tree. A child directory already absent is treated as
- * already deleted; the root's absence is still a refusal.
+ * already deleted; the root's absence is still a refusal. Even a partial failure
+ * cleans up the child directories that were already removed, because their logs
+ * are gone and a retry can no longer name their attachments.
  *
  * Only a Session that is neither in the live Session store nor held by a live
  * Agent nor running a background job may be deleted. Reminders targeting the
  * tree are removed before any session directory, because they can activate the
- * Session during deletion.
+ * Session during deletion. Overlapping in-process requests for the same id are
+ * refused with `busy`.
  * @param ctx - Host context carrying the services the deletion uses.
  * @param rawSessionId - requested Session id, used exactly as stored.
  * @param options - optional attachment cleanup (`deleteAttachments`); the internal
@@ -129,9 +136,26 @@ async function respond(ctx, request) {
  * @returns a structured result; `ok` is false for every refusal or partial delete.
  */
 export async function deleteSession(ctx, rawSessionId, options = {}) {
-  const deleteAttachments = options?.deleteAttachments === true
   if (!isSessionId(rawSessionId)) return failure('invalid-id', typeof rawSessionId === 'string' ? rawSessionId : '')
-  const sessionId = rawSessionId
+  if (inflightDeletions.has(rawSessionId)) return failure('busy', rawSessionId)
+  inflightDeletions.add(rawSessionId)
+  try {
+    return await deleteSessionLocked(ctx, rawSessionId, options)
+  } finally {
+    inflightDeletions.delete(rawSessionId)
+  }
+}
+
+/**
+ * Delete one Session after the exported entry point claimed the in-process
+ * guard. Split out so every return path releases that guard.
+ * @param ctx - Host context carrying the services the deletion uses.
+ * @param sessionId - requested Session id, used exactly as stored.
+ * @param options - optional attachment cleanup and test overrides.
+ * @returns a structured result; `ok` is false for every refusal or partial delete.
+ */
+async function deleteSessionLocked(ctx, sessionId, options) {
+  const deleteAttachments = options?.deleteAttachments === true
 
   const persistence = ctx.get('sessionPersistence')
   if (persistence === undefined) return failure('unavailable')
@@ -219,13 +243,6 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
       return { ...failure('live', stillLive.session.sessionId), reason: stillLive.session.reason }
     }
 
-    // A live surviving Session whose log is still pending has attachment
-    // references only in memory; opening its log would return an empty prefix.
-    // Keep every attachment rather than treating that unknown as "none". The
-    // pending probe falls back to the public stat() snapshot when a backend
-    // does not expose the JSONL implementation's hasPendingSession().
-    const pendingSurvivor = await hasPendingSurvivingSession(ctx, persistence, tree)
-
     // Reminders can activate a Session without leaving an Agent or Session
     // object in the registries until the delivery starts. Clear them before
     // touching logs, then check liveness again; `edit`/`delete` is serialized
@@ -275,7 +292,8 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
         continue
       }
       try {
-        await removeDirectory(locations.sessionRoot, plan.directory)
+        await verifySessionDirectory(persistence, plan.id, plan.directory)
+        await removeDirectory(locations.sessionRoot, plan.directory, plan.id)
         deleted.push(plan.id)
       } catch (error) {
         failed.push({ sessionId: plan.id, code: 'delete-failed', message: describe(error) })
@@ -283,111 +301,142 @@ export async function deleteSession(ctx, rawSessionId, options = {}) {
       }
     }
 
-    if (failed.length > 0) {
-      const result = {
-        ok: false,
-        code: 'partial',
-        message: FAILURE_MESSAGES.partial,
-        sessionId,
-        deleted,
-        failed,
-        schedules: scheduleOutcome.removed,
-      }
-      return result
-    }
-
-    try {
-      await removeDirectory(locations.sessionRoot, rootPlan.directory)
-      deleted.push(sessionId)
-    } catch (error) {
-      const result = {
-        ok: false,
-        code: 'partial',
-        message: FAILURE_MESSAGES.partial,
-        sessionId,
-        deleted,
-        failed: [{ sessionId, code: 'delete-failed', message: describe(error) }],
-        schedules: scheduleOutcome.removed,
-      }
-      return result
-    }
-
-    const gone = [...deleted, ...alreadyGone]
-    const caches = await deleteProjectionCache(
-      locations.storagesRoot,
-      locations.projectionCacheRoot,
-      gone,
-    )
-    // A fork created while the deletion ran must be visible to the spill
-    // decision, and a new unaccounted session directory must keep attachment
-    // cleanup closed. Re-list and re-scan once after the logs are gone.
-    const latest = locations.spillRoot !== undefined
-      || (owned !== undefined && locations.attachmentsRoot !== undefined)
-      ? await refreshCatalog(persistence, locations.sessionRoot)
-      : { byId, catalog: undefined }
-    const spillRoots = await resolveSpillRoots(locations)
-    const spill = await deleteSpillDirectories(spillRoots, latest.byId, gone, latest.catalog)
-    // Attachment candidates come from directories actually removed. A child
-    // directory already absent keeps its referenced objects: without a stored
-    // log the references cannot be proven absent. When the attachment service
-    // exposes no root the scan is skipped entirely and the report stays
-    // fail-closed.
-    const attachments = deleteAttachments === false
-      ? undefined
-      : owned === undefined
-        ? {
-            status: 'unverified',
-            reason: 'unavailable',
-            deleted: 0,
-            kept: 0,
-            failed: 0,
-            missing: 0,
-            bytes: 0,
-            staging: 0,
-          }
-        : await settleAttachments(
-            persistence,
-            tree,
-            deleted,
-            owned,
-            ctx,
-            {
-              signal: budget.signal,
-              locations,
-              catalog: latest.catalog,
-              pendingSurvivor,
-            },
-          )
-    // Workspace archive/pin sets are not pruned by the registry's header
-    // refresh. Clear a stale id when the mounted registry exposes the public
-    // idempotent operations; failure is only stale derived state.
-    await clearWorkspaceSessionState(ctx, gone)
-
-    // Announce that these Sessions left the catalog so a connected page drops
-    // their rows immediately instead of keeping stale rows until a reload.
-    // Emit in tree order (root first) so the observable order is deterministic.
-    const goneSet = new Set(gone)
-    for (const id of tree) {
-      if (!goneSet.has(id)) continue
+    if (failed.length === 0) {
       try {
-        ctx.emit('api-session/removed', id)
-      } catch {
-        /* observation only */
+        await verifySessionDirectory(persistence, sessionId, rootPlan.directory)
+        await removeDirectory(locations.sessionRoot, rootPlan.directory, sessionId)
+        deleted.push(sessionId)
+      } catch (error) {
+        if (deleted.length === 0
+          && error?.code === 'SESSION_GONE'
+          && await isSessionGone(persistence, sessionId, rootPlan.directory)) {
+          return withSchedulesRemoved(failure('not-found', sessionId), scheduleOutcome.removed)
+        }
+        failed.push({ sessionId, code: 'delete-failed', message: describe(error) })
       }
     }
 
-    const result = {
-      ok: true,
+    // A partial failure may already have removed child directories. Clean up
+    // exactly those ids now: their logs no longer exist, so this is the last
+    // point where their attachment, spill, cache, and workspace references can
+    // be reclaimed. The surviving root or failed child is still a tree member,
+    // so `settleAttachments` keeps every object it references.
+    const gone = [...deleted, ...alreadyGone]
+    const reports = gone.length === 0
+      ? { caches: 0 }
+      : await enqueueCleanup(() => cleanupDeletedArtifacts({
+          persistence,
+          tree,
+          deleted,
+          gone,
+          owned,
+          ctx,
+          locations,
+          signal: budget?.signal,
+          deleteAttachments,
+        }))
+
+    const base = {
       sessionId,
       deleted,
       schedules: scheduleOutcome.removed,
-      caches,
-      ...(spill === undefined ? {} : { spill }),
-      ...(attachments === undefined ? {} : { attachments }),
+      ...reports,
     }
-    return result
+    if (failed.length > 0) {
+      return { ok: false, code: 'partial', message: FAILURE_MESSAGES.partial, ...base, failed }
+    }
+    return { ok: true, ...base }
   } finally {
     budget?.stop()
+  }
+}
+
+/**
+ * Run one derived-cleanup pass after every earlier pass in this process.
+ *
+ * Two deletions of different Sessions can otherwise both observe the other's
+ * still-present log and keep a shared attachment. The later serialized pass
+ * sees both logs gone (when both deletes succeeded) and can reclaim it.
+ * @param task - cleanup work to run.
+ * @returns the task result, or its rejection.
+ */
+function enqueueCleanup(task) {
+  const run = cleanupTail.then(task, task)
+  cleanupTail = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
+/**
+ * Remove derived state and optional attachment objects for the Sessions that
+ * actually left the catalog, including a subtree removed before a later
+ * failure. The catalog is refreshed once after the removals so both spill and
+ * attachment decisions see the surviving tree.
+ * @param options - service, tree, removed ids, owned references, roots, and budget.
+ * @returns report fields for the success or partial result.
+ */
+async function cleanupDeletedArtifacts(options) {
+  const { persistence, tree, deleted, gone, owned, ctx, locations, signal, deleteAttachments } = options
+  const caches = await deleteProjectionCache(
+    locations.storagesRoot,
+    locations.projectionCacheRoot,
+    gone,
+  )
+  // A fork created while the deletion ran must be visible to the spill
+  // decision, and a new unaccounted session directory must keep attachment
+  // cleanup closed. Re-list and re-scan once after the logs are gone.
+  const latest = locations.spillRoot !== undefined
+    || (owned !== undefined && locations.attachmentsRoot !== undefined)
+    ? await refreshCatalog(persistence, locations.sessionRoot)
+    : { byId: new Map(), catalog: undefined }
+  const spillRoots = await resolveSpillRoots(locations)
+  const spill = await deleteSpillDirectories(spillRoots, latest.byId, gone, latest.catalog)
+  // Attachment candidates come from directories actually removed. A child
+  // directory already absent keeps its referenced objects: without a stored
+  // log the references cannot be proven absent. When the attachment service
+  // exposes no root the scan is skipped entirely and the report stays
+  // fail-closed.
+  const attachments = deleteAttachments === false
+    ? undefined
+    : owned === undefined
+      ? unavailableAttachmentReport()
+      : await settleAttachments(
+          persistence,
+          tree,
+          deleted,
+          owned,
+          ctx,
+          {
+            signal,
+            locations,
+            catalog: latest.catalog,
+            snapshots: [...latest.byId.values()],
+          },
+        )
+  // Workspace archive/pin sets are not pruned by the registry's header
+  // refresh. Clear a stale id when the mounted registry exposes the public
+  // idempotent operations; failure is only stale derived state.
+  await clearWorkspaceSessionState(ctx, gone)
+
+  // Announce that these Sessions left the catalog so a connected page drops
+  // their rows immediately instead of keeping stale rows until a reload.
+  // Emit in tree order (root first) so the observable order is deterministic.
+  const goneSet = new Set(gone)
+  for (const id of tree) {
+    if (!goneSet.has(id)) continue
+    try {
+      ctx.emit('api-session/removed', id)
+    } catch {
+      /* observation only */
+    }
+  }
+
+  return {
+    caches,
+    ...(spill === undefined ? {} : { spill }),
+    ...(attachments === undefined ? {} : { attachments }),
   }
 }
 
@@ -450,7 +499,7 @@ async function refreshCatalog(persistence, sessionRoot) {
     for (const snapshot of snapshots) byId.set(String(snapshot.header.id), snapshot)
     return { byId, catalog: await inspectCatalog(sessionRoot, byId) }
   } catch {
-    return { byId: new Map(), catalog: { incomplete: true, unaccounted: [], unaccountedPaths: [], duplicates: [] } }
+    return { byId: new Map(), catalog: { incomplete: true, unaccountedPaths: [], duplicates: [], failedProjects: [] } }
   }
 }
 
@@ -468,14 +517,14 @@ async function refreshCatalog(persistence, sessionRoot) {
  * @returns what makes the catalog incomplete, if anything.
  */
 async function inspectCatalog(sessionRoot, known) {
-  const result = { incomplete: false, unaccounted: [], unaccountedPaths: [], duplicates: [] }
+  const result = { incomplete: false, unaccountedPaths: [], duplicates: [], failedProjects: [] }
   const knownDirs = new Set()
   const knownNames = new Set()
   for (const snapshot of known.values()) {
     const path = snapshot?.location?.path
-    if (typeof path === 'string' && isAbsolute(path)) knownDirs.add(resolve(dirname(path)))
+    if (typeof path === 'string' && isAbsolute(path)) knownDirs.add(pathKey(dirname(path)))
     const id = String(snapshot?.header?.id ?? '')
-    if (id !== '') knownNames.add(encodeSegment(id))
+    if (id !== '') knownNames.add(nameKey(encodeSegment(id)))
   }
 
   let projects
@@ -493,24 +542,24 @@ async function inspectCatalog(sessionRoot, known) {
       entries = await readdir(join(sessionRoot, project.name), { withFileTypes: true })
     } catch {
       result.incomplete = true
+      result.failedProjects.push(join(sessionRoot, project.name))
       continue
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue
       const directory = join(sessionRoot, project.name, entry.name)
-      if (knownDirs.has(resolve(directory)) || knownNames.has(entry.name)) {
-        const count = (seen.get(entry.name) ?? 0) + 1
-        seen.set(entry.name, count)
+      const entryKey = nameKey(entry.name)
+      if (knownDirs.has(pathKey(directory)) || knownNames.has(entryKey)) {
+        const count = (seen.get(entryKey) ?? 0) + 1
+        seen.set(entryKey, count)
         if (count === 2) result.duplicates.push(entry.name)
         continue
       }
       const hasArtifact = await hasSessionArtifact(directory)
       if (hasArtifact === undefined) {
         result.incomplete = true
-        result.unaccounted.push(entry.name)
         result.unaccountedPaths.push(directory)
       } else if (hasArtifact) {
-        result.unaccounted.push(entry.name)
         result.unaccountedPaths.push(directory)
       }
     }
@@ -525,9 +574,11 @@ async function inspectCatalog(sessionRoot, known) {
  * `sessionPersistence.list()` deliberately skips sessions whose header the
  * current Build cannot read. Such a directory can still be a subagent child of
  * the root, and a readable grandchild can point at a parent that is no longer in
- * the catalog. Deleting the root in either case would leave a hidden orphan
- * (`deleteSession` refuses a subagent as a root), so this check fails closed for
- * the root's project before any attachment read, schedule removal, or `rm`.
+ * the catalog. A subagent with an empty parent link or a cyclic parent chain is
+ * equally unresolvable. Deleting the root in any of those cases would leave a
+ * hidden orphan (`deleteSession` refuses a subagent as a root), so this check
+ * fails closed for the root's project before any attachment read, schedule
+ * removal, or `rm`.
  * @param sessionRoot - the session persistence root.
  * @param projectDirectory - the project directory holding the root Session.
  * @param tree - Session ids being deleted, root first.
@@ -542,8 +593,8 @@ async function ensureTreeCatalogComplete(sessionRoot, projectDirectory, tree, by
     return { code: 'tree-incomplete', detail: describe(error) }
   }
 
-  const treeNames = new Set(tree.map((id) => encodeSegment(id)))
-  const duplicateTreeIds = catalog.duplicates.filter((name) => treeNames.has(name))
+  const treeNames = new Set(tree.map((id) => nameKey(encodeSegment(id))))
+  const duplicateTreeIds = catalog.duplicates.filter((name) => treeNames.has(nameKey(name)))
   if (duplicateTreeIds.length > 0) {
     return {
       code: 'ambiguous',
@@ -561,13 +612,16 @@ async function ensureTreeCatalogComplete(sessionRoot, projectDirectory, tree, by
     }
   }
 
-  // `inspectCatalog` records a failed project read as `incomplete` without a
-  // path. Re-read just this project so a failure there is never mistaken for a
-  // clean sibling project.
-  try {
-    await readdir(projectDirectory, { withFileTypes: true })
-  } catch (error) {
-    return { code: 'tree-incomplete', detail: `project directory cannot be read: ${describe(error)}` }
+  const failedLocalProject = catalog.failedProjects.some(
+    (directory) => samePath(resolve(directory), projectDirectory),
+  )
+  if (failedLocalProject) {
+    return { code: 'tree-incomplete', detail: 'the root project directory cannot be read' }
+  }
+  // A root-level scan failure leaves no per-project path; refuse rather than
+  // treating an unreadable session root as an empty, complete catalog.
+  if (catalog.incomplete === true && catalog.failedProjects.length === 0 && catalog.unaccountedPaths.length === 0) {
+    return { code: 'tree-incomplete', detail: 'the session root cannot be inspected completely' }
   }
 
   const treeSet = new Set(tree)
@@ -578,14 +632,20 @@ async function ensureTreeCatalogComplete(sessionRoot, projectDirectory, tree, by
 
     let parentId = typeof header.parentSession === 'string' ? header.parentSession : ''
     const seen = new Set([id])
-    let unresolved = false
+    let unresolved = parentId === ''
     let descendsFromTree = false
     while (parentId !== '') {
       if (treeSet.has(parentId)) {
         descendsFromTree = true
         break
       }
-      if (seen.has(parentId)) break
+      if (seen.has(parentId)) {
+        // A cycle is a damaged lineage, not a resolved independent owner.
+        // Deleting the requested root could leave this subagent unreachable
+        // because this API refuses to delete a subagent as a root.
+        unresolved = true
+        break
+      }
       seen.add(parentId)
       const parentSnapshot = byId.get(parentId)
       if (parentSnapshot === undefined) {
@@ -598,9 +658,16 @@ async function ensureTreeCatalogComplete(sessionRoot, projectDirectory, tree, by
       // lineage and the chain is followed (fail-closed).
       if (parentSnapshot.header?.origin !== 'subagent'
         && parentSnapshot.header?.isSeeded === true) break
-      parentId = typeof parentSnapshot.header?.parentSession === 'string'
+      const nextParent = typeof parentSnapshot.header?.parentSession === 'string'
         ? parentSnapshot.header.parentSession
         : ''
+      if (nextParent === '' && parentSnapshot.header?.origin === 'subagent') {
+        // A subagent intermediate with no parent link is as unresolvable as a
+        // missing parent: the chain cannot prove independent ownership.
+        unresolved = true
+        break
+      }
+      parentId = nextParent
     }
 
     if (descendsFromTree) {
@@ -730,6 +797,24 @@ function walkAttachmentRefs(roots, visit) {
 }
 
 /**
+ * The fail-closed attachment report used when the attachment service exposes
+ * no root, so no object can be proven unreferenced or removed.
+ * @returns the report carried by the successful deletion.
+ */
+function unavailableAttachmentReport() {
+  return {
+    status: 'unverified',
+    reason: 'unavailable',
+    deleted: 0,
+    kept: 0,
+    failed: 0,
+    missing: 0,
+    bytes: 0,
+    staging: 0,
+  }
+}
+
+/**
  * Remove the attachment objects that only the deleted Sessions referenced.
  *
  * One rule: an object referenced by any Session that survives the deletion stays,
@@ -744,24 +829,19 @@ function walkAttachmentRefs(roots, visit) {
  * @param deletedIds - Sessions whose directory this request removed.
  * @param owned - attachment refs per tree Session, read before deletion.
  * @param ctx - Host context carrying the optional live Session store.
- * @param options - the shared budget, resolved store roots, and catalog findings.
+ * @param options - the shared budget, resolved store roots, catalog findings,
+ * and optionally the already-refreshed survivor snapshots.
  * @returns the attachment report carried by the response.
  */
 async function settleAttachments(persistence, tree, deletedIds, owned, ctx, options) {
   const report = { status: 'applied', deleted: 0, kept: 0, failed: 0, missing: 0, bytes: 0, staging: 0 }
-  if (options.locations.attachmentsRoot === undefined) {
-    return { ...report, status: 'unverified', reason: 'unavailable' }
-  }
-  if (options.pendingSurvivor === true) {
-    return { ...report, status: 'unverified', reason: 'pending' }
-  }
   if (owned.unreadable.length > 0) {
     return { ...report, status: 'unverified', reason: options.signal.aborted ? 'timeout' : 'unreadable' }
   }
-  if (options.catalog === undefined || options.catalog.incomplete === true) {
+  if (options.catalog.incomplete === true) {
     return { ...report, status: 'unverified', reason: 'catalog' }
   }
-  if (options.catalog.unaccounted.length > 0 || options.catalog.duplicates.length > 0) {
+  if (options.catalog.unaccountedPaths.length > 0 || options.catalog.duplicates.length > 0) {
     return { ...report, status: 'unverified', reason: 'catalog' }
   }
 
@@ -790,10 +870,14 @@ async function settleAttachments(persistence, tree, deletedIds, owned, ctx, opti
   }
 
   let snapshots
-  try {
-    snapshots = await persistence.list({ signal: options.signal })
-  } catch {
-    return { ...report, status: 'unverified', reason: options.signal.aborted ? 'timeout' : 'unreadable' }
+  if (options.snapshots !== undefined) {
+    snapshots = options.snapshots
+  } else {
+    try {
+      snapshots = await persistence.list({ signal: options.signal })
+    } catch {
+      return { ...report, status: 'unverified', reason: options.signal.aborted ? 'timeout' : 'unreadable' }
+    }
   }
   for (const snapshot of snapshots) {
     if (pending.size === 0) break
@@ -806,6 +890,12 @@ async function settleAttachments(persistence, tree, deletedIds, owned, ctx, opti
       return { ...report, status: 'unverified', reason: options.signal.aborted ? 'timeout' : 'unreadable' }
     }
     if (live === undefined) {
+      // A listed survivor without a materialized artifact has no durable log
+      // to scan. That is an unknown reference only while the backend still
+      // reports it pending; a materialized older snapshot can be read below.
+      if (snapshot.location === undefined && await isPendingSnapshot(persistence, snapshot, options.signal)) {
+        return { ...report, status: 'unverified', reason: 'pending' }
+      }
       // A materialized Session that is not live in this process may still be
       // live in another process. Its write-behind buffer can hold attachment
       // references that the persisted log does not. A successful write-lease
@@ -818,6 +908,10 @@ async function settleAttachments(persistence, tree, deletedIds, owned, ctx, opti
       if (probe.error !== undefined || probe.missing === true) {
         return { ...report, status: 'unverified', reason: options.signal.aborted ? 'timeout' : 'unreadable' }
       }
+    } else if (live === null || typeof live.snapshotEvents !== 'function') {
+      // Without the deprecated in-memory read there is no way to observe a
+      // live write-behind buffer; keep every candidate.
+      return { ...report, status: 'unverified', reason: 'unreadable' }
     }
     let found
     try {
@@ -861,6 +955,39 @@ async function settleAttachments(persistence, tree, deletedIds, owned, ctx, opti
   report.staging = await sweepStaging(attachmentsRoot)
   if (report.failed > 0) report.status = 'partial'
   return report
+}
+
+/**
+ * Whether one listed survivor is still an unmaterialized pending Session.
+ *
+ * A snapshot without a `location` has no durable log to scan. The JSONL
+ * backend exposes `hasPendingSession()`; other backends fall back to the public
+ * `stat()` snapshot. A failed probe is treated as pending (unknown), so the
+ * caller keeps every attachment; a backend with no probe at all is also treated
+ * as pending because it cannot prove the references absent.
+ * @param persistence - Session persistence service.
+ * @param snapshot - listed survivor snapshot.
+ * @param signal - optional attachment-phase cancellation.
+ * @returns true when the Session has no materialized log.
+ */
+async function isPendingSnapshot(persistence, snapshot, signal) {
+  const id = String(snapshot.header.id)
+  if (typeof persistence.hasPendingSession === 'function') {
+    try {
+      return persistence.hasPendingSession(id)
+    } catch {
+      return true
+    }
+  }
+  // No backend probe exists. The snapshot has no durable `location`, so its
+  // references cannot be proven absent; fail closed.
+  if (typeof persistence.stat !== 'function') return true
+  try {
+    const current = await persistence.stat(id, signal === undefined ? undefined : { signal })
+    return current === undefined || current.location === undefined
+  } catch {
+    return true
+  }
 }
 
 /**
@@ -1065,13 +1192,40 @@ function isStrictlyInside(root, path) {
 }
 
 /**
- * Compare two normalized paths with the host filesystem's case rules.
+ * Compare two normalized paths with the host filesystem's identity rules.
+ * Windows folds case; macOS commonly stores decomposed Unicode, so normalize
+ * to NFC before comparing.
  * @param left - normalized path.
  * @param right - normalized path.
  * @returns whether they name the same path.
  */
 function samePath(left, right) {
-  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
+  if (process.platform === 'win32') return left.toLowerCase() === right.toLowerCase()
+  if (process.platform === 'darwin') return left.normalize('NFC') === right.normalize('NFC')
+  return left === right
+}
+
+/**
+ * Normalize one absolute path into the key used by catalog directory sets.
+ * @param value - absolute directory path.
+ * @returns the platform-normalized resolved path.
+ */
+function pathKey(value) {
+  const absolute = resolve(value)
+  if (process.platform === 'win32') return absolute.toLowerCase()
+  if (process.platform === 'darwin') return absolute.normalize('NFC')
+  return absolute
+}
+
+/**
+ * Normalize one encoded Session directory name for catalog lookups.
+ * @param value - one path segment.
+ * @returns the platform-normalized segment.
+ */
+function nameKey(value) {
+  if (process.platform === 'win32') return value.toLowerCase()
+  if (process.platform === 'darwin') return value.normalize('NFC')
+  return value
 }
 
 /**
@@ -1197,8 +1351,8 @@ function findLiveDescendant(deleting, byId, agents, sessions) {
  * Whether one live Session's subagent parent chain reaches the deletion tree.
  *
  * Only `origin: 'subagent'` sessions are owned by a parent; an ordinary fork is
- * an independent lineage. A missing parent is treated as unknown lineage and
- * blocks deletion rather than being ignored.
+ * an independent lineage. A missing parent, an empty parent link, or a cycle is
+ * treated as unknown lineage and blocks deletion rather than being ignored.
  * @param header - live Session header, when available.
  * @param deleting - ids in the deletion tree.
  * @param byId - catalog snapshots keyed by Session id.
@@ -1212,7 +1366,7 @@ function descendsFrom(header, deleting, byId, sessions) {
   const seen = new Set([String(header.id ?? '')])
   for (;;) {
     if (deleting.has(parent)) return true
-    if (seen.has(parent)) return false
+    if (seen.has(parent)) return true
     seen.add(parent)
     const parentHeader = sessions?.get?.(parent)?.header ?? byId.get(parent)?.header
     if (parentHeader === undefined) return true
@@ -1220,7 +1374,7 @@ function descendsFrom(header, deleting, byId, sessions) {
     // own subagent children do not descend from this root.
     if (parentHeader.origin !== 'subagent') return false
     parent = typeof parentHeader.parentSession === 'string' ? parentHeader.parentSession : ''
-    if (parent === '') return false
+    if (parent === '') return true
   }
 }
 
@@ -1247,8 +1401,10 @@ async function checkLive(ctx, sessionIds, byId) {
  * cannot see a writer in another process. A short write-open is the public way
  * to acquire the same lease: success proves no other writer holds it, while
  * `SessionAlreadyOwnedError` refuses the deletion. The handle is closed without
- * appending, flushing, or migrating; a `migration-required` log is skipped
- * because a write open would publish a migration as a side effect.
+ * appending or flushing. A `migration-required` tree log is deliberately probed:
+ * the write open publishes a migrated generation, which is harmless because the
+ * directory is then removed (and leaves an intact migrated Session if a later
+ * step fails). Survivor probes never publish a migration.
  * @param persistence - Session persistence service.
  * @param tree - Sessions being deleted.
  * @param byId - catalog snapshots keyed by Session id.
@@ -1328,58 +1484,6 @@ async function checkActivity(ctx, sessionIds) {
     }
   }
   return {}
-}
-
-/**
- * Whether a live Session outside the deletion tree has an unmaterialized log.
- *
- * The JSONL backend keeps a just-created Session in memory until its first
- * append/flush. Reading it through `open(..., 'read')` returns an empty prefix,
- * so its attachment references cannot be discovered. This is an unknown
- * reference, not an empty one; attachment cleanup must keep everything.
- *
- * `hasPendingSession()` is a JSONL implementation detail, so a backend without
- * it is probed through the public `stat()` snapshot: a pending session has no
- * materialized `location`. A failing probe is treated as unknown and keeps
- * every attachment.
- * @param ctx - Host context.
- * @param persistence - Session persistence service.
- * @param tree - Sessions being deleted.
- * @returns true when a surviving live Session is still pending.
- */
-async function hasPendingSurvivingSession(ctx, persistence, tree) {
-  const sessions = ctx.get('sessions')
-  if (sessions === undefined || typeof sessions.list !== 'function') return false
-  const deleting = new Set(tree)
-  let live
-  try {
-    live = sessions.list()
-  } catch {
-    return true
-  }
-  const survivors = []
-  for (const session of live) {
-    const id = String(session?.id ?? '')
-    if (id === '' || deleting.has(id)) continue
-    survivors.push(id)
-  }
-  if (survivors.length === 0) return false
-
-  const hasProbe = typeof persistence.hasPendingSession === 'function'
-  if (!hasProbe && typeof persistence.stat !== 'function') return true
-  for (const id of survivors) {
-    try {
-      if (hasProbe) {
-        if (persistence.hasPendingSession(id)) return true
-        continue
-      }
-      const snapshot = await persistence.stat(id)
-      if (snapshot === undefined || snapshot.location === undefined) return true
-    } catch {
-      return true
-    }
-  }
-  return false
 }
 
 /**
@@ -1571,7 +1675,11 @@ async function listScheduleTasks(schedule) {
     if (items.length === 0) break
     const before = tasks.length
     tasks.push(...items)
-    if (tasks.length >= Number(page.total ?? 0) || tasks.length === before) break
+    const total = typeof page.total === 'number' && Number.isSafeInteger(page.total) && page.total >= 0
+      ? page.total
+      : undefined
+    if (total !== undefined && tasks.length >= total) break
+    if (tasks.length === before) break
     offset += items.length
   }
   return tasks
@@ -1648,16 +1756,17 @@ async function deleteProjectionCache(storagesRoot, directory, sessionIds) {
  * `storagesRoot` are undefined when the mounted service does not expose one.
  */
 function resolveLocations(ctx, persistence = ctx?.get?.('sessionPersistence')) {
-  // `config.root` is the public configuration; the resolved `root` field is a
-  // JSONL implementation detail kept only as a fallback for a wrapper backend.
-  const configuredRoot = typeof persistence?.config?.root === 'string' && persistence.config.root !== ''
-    ? persistence.config.root
-    : persistence?.root
+  // The backend's resolved `root` is authoritative. `config.root` remains the
+  // public fallback for a wrapper backend that does not expose the resolved
+  // path; resolving it again here would depend on the current working directory.
+  const resolvedRoot = persistence?.root
+  const configuredRoot = typeof resolvedRoot === 'string' && resolvedRoot !== ''
+    ? resolvedRoot
+    : persistence?.config?.root
   const sessionRoot = typeof configuredRoot === 'string' && configuredRoot !== ''
     ? resolve(configuredRoot)
     : undefined
 
-  const home = resolveHome()
   const attachmentRoot = ctx?.get?.('attachments')?.root
   const attachmentsRoot = typeof attachmentRoot === 'string' && attachmentRoot !== ''
     ? resolve(attachmentRoot)
@@ -1670,7 +1779,7 @@ function resolveLocations(ctx, persistence = ctx?.get?.('sessionPersistence')) {
   const spillRootIsPrivate = spillRoot !== undefined
     && typeof spillStore?.config?.root !== 'string'
     && SPILL_ROOT_NAME.test(basename(spillRoot))
-  const storagesRoot = resolveStorageRoot(ctx, home)
+  const storagesRoot = resolveStorageRoot(ctx)
 
   return {
     sessionRoot,
@@ -1690,16 +1799,15 @@ function resolveLocations(ctx, persistence = ctx?.get?.('sessionPersistence')) {
  * The shipped composition mounts the `storage` hub over a `json` backend whose
  * root is itself configurable. Reading that root is preferable to assuming
  * `<DSH_HOME>/storages`: deleting the assumed path while the real cache lives
- * elsewhere could touch another profile's derived data. When the hub is mounted
- * but the backend root cannot be inspected, cache cleanup is skipped rather than
+ * elsewhere could touch another profile's derived data. When the hub is absent,
+ * or its backend root cannot be inspected, cache cleanup is skipped rather than
  * guessing.
  * @param ctx - Host context.
- * @param home - resolved Harness home.
  * @returns the backend root, or undefined when it cannot be confirmed.
  */
-function resolveStorageRoot(ctx, home) {
+function resolveStorageRoot(ctx) {
   const storage = ctx?.get?.('storage')
-  if (storage === undefined) return join(home, 'storages')
+  if (storage === undefined) return undefined
   let backend
   try {
     backend = storage.backend?.get?.('json')
@@ -1710,30 +1818,6 @@ function resolveStorageRoot(ctx, home) {
     ? backend.root
     : backend?.config?.root
   return typeof root === 'string' && root !== '' ? resolve(root) : undefined
-}
-
-/**
- * The harness home: `DSH_HOME` or `~/.dsh`, with the same tilde expansion and
- * absolute normalization as `resolveDshHome` in `dsh-home-paths`.
- * @returns the resolved Harness home.
- */
-function resolveHome() {
-  const configured = process.env.DSH_HOME
-  const selected = configured === undefined || configured.trim() === ''
-    ? join(homedir(), '.dsh')
-    : expandHome(configured)
-  return resolve(selected)
-}
-
-/**
- * Expand the tilde forms `resolveDshHome` accepts.
- * @param value - configured path.
- * @returns the expanded path.
- */
-function expandHome(value) {
-  if (value === '~') return homedir()
-  if (value.startsWith('~/') || value.startsWith('~\\')) return join(homedir(), value.slice(2))
-  return value
 }
 
 /**
@@ -1815,6 +1899,13 @@ async function planSessionDirectories(root, sessionIds, byId) {
       } catch (error) {
         return { code: 'delete-failed', detail: describe(error) }
       }
+      if (!samePath(basename(directory), encodeSegment(id))) {
+        return {
+          code: 'ambiguous',
+          detail: `session "${id}" catalog directory name does not match its encoded id`,
+          failed: [{ sessionId: id, code: 'ambiguous', directory }],
+        }
+      }
       const info = await inspectPath(directory)
       if (info.error !== undefined) return { code: 'delete-failed', detail: describe(info.error) }
       if (info.entry === undefined) {
@@ -1879,36 +1970,120 @@ async function planSessionDirectories(root, sessionIds, byId) {
 }
 
 /**
+ * Re-prove immediately before removal that the backend still maps one Session
+ * id to the planned directory. `stat()` reads only the header, so this catches
+ * a replaced log or a moved materialized location without reading the full log
+ * again. Backends without `stat()` are left to the path checks below.
+ * @param persistence - Session persistence service.
+ * @param sessionId - Session whose directory is about to be removed.
+ * @param directory - planned directory under the session root.
+ */
+async function verifySessionDirectory(persistence, sessionId, directory) {
+  if (typeof persistence.stat !== 'function') return
+  const snapshot = await persistence.stat(sessionId)
+  const location = snapshot?.location?.path
+  if (typeof location !== 'string' || !isAbsolute(location)) {
+    const error = new Error(`session "${sessionId}" no longer has a materialized stored log`)
+    error.code = 'SESSION_GONE'
+    throw error
+  }
+  const actual = await realpathOrError(dirname(location))
+  if (actual.error !== undefined) {
+    if (isAbsentError(actual.error)) {
+      const error = new Error(`session "${sessionId}" stored log disappeared`)
+      error.code = 'SESSION_GONE'
+      throw error
+    }
+    throw actual.error
+  }
+  const expected = await realpathOrError(directory)
+  if (expected.error !== undefined) {
+    if (isAbsentError(expected.error)) {
+      const error = new Error(`session "${sessionId}" stored directory disappeared`)
+      error.code = 'SESSION_GONE'
+      throw error
+    }
+    throw expected.error
+  }
+  if (!samePath(actual.path, expected.path)) {
+    throw new Error(`session "${sessionId}" moved to a different stored directory during deletion`)
+  }
+}
+
+/**
+ * Whether a failed root removal raced another process that already removed the
+ * Session. The caller must first observe a `SESSION_GONE` error, and the
+ * directory must be absent with no materialized catalog entry.
+ * @param persistence - Session persistence service.
+ * @param sessionId - Session whose root removal failed.
+ * @param directory - planned root directory.
+ * @returns true when the Session is already gone.
+ */
+async function isSessionGone(persistence, sessionId, directory) {
+  const info = await inspectPath(directory)
+  if (info.entry !== undefined || info.error !== undefined) return false
+  if (typeof persistence.stat !== 'function') return true
+  try {
+    return await persistence.stat(sessionId) === undefined
+  } catch {
+    return false
+  }
+}
+
+/**
  * Remove one planned Session directory after re-proving it has not been
  * replaced by a link since planning. This re-resolves both sides immediately
  * before removal, narrowing the path-swap window.
  * @param root - the sessions root.
  * @param directory - the planned directory under the root.
+ * @param sessionId - Session whose directory was planned, when known.
  */
-async function removeSessionDirectory(root, directory) {
+async function removeSessionDirectory(root, directory, sessionId) {
+  const expectedName = sessionId === undefined ? undefined : encodeSegment(sessionId)
   const rootInfo = await realpathOrError(root)
   if (rootInfo.error !== undefined) throw rootInfo.error
+  if (expectedName !== undefined && !samePath(basename(directory), expectedName)) {
+    throw new Error('refusing to delete a directory whose planned name does not match the session id')
+  }
   const originalInfo = await inspectPath(directory)
   if (originalInfo.error !== undefined) throw originalInfo.error
-  if (originalInfo.entry === undefined
-    || !originalInfo.entry.isDirectory()
-    || originalInfo.entry.isSymbolicLink()) {
+  if (originalInfo.entry === undefined) {
+    const error = new Error('refusing to delete a session directory that no longer exists')
+    error.code = 'SESSION_GONE'
+    throw error
+  }
+  if (!originalInfo.entry.isDirectory() || originalInfo.entry.isSymbolicLink()) {
     throw new Error('refusing to delete a session directory that is no longer a plain directory')
   }
   const directoryInfo = await realpathOrError(directory)
-  if (directoryInfo.error !== undefined) throw directoryInfo.error
+  if (directoryInfo.error !== undefined) {
+    if (isAbsentError(directoryInfo.error)) {
+      const error = new Error('refusing to delete a session directory that no longer exists')
+      error.code = 'SESSION_GONE'
+      throw error
+    }
+    throw directoryInfo.error
+  }
   if (!isStrictlyInside(rootInfo.path, directoryInfo.path)) {
     throw new Error('refusing to delete a directory that resolves outside the session root')
   }
   if (!samePath(dirname(dirname(directoryInfo.path)), rootInfo.path)) {
     throw new Error('refusing to delete a directory that is not exactly two levels below the session root')
   }
+  if (expectedName !== undefined && !samePath(basename(directoryInfo.path), expectedName)) {
+    throw new Error('refusing to delete a directory whose resolved name does not match the session id')
+  }
   if (!samePath(basename(directoryInfo.path), basename(directory))) {
     throw new Error('refusing to delete a directory whose resolved name changed')
   }
   const info = await inspectPath(directoryInfo.path)
   if (info.error !== undefined) throw info.error
-  if (info.entry === undefined || !info.entry.isDirectory() || info.entry.isSymbolicLink()) {
+  if (info.entry === undefined) {
+    const error = new Error('refusing to delete a session directory that no longer exists')
+    error.code = 'SESSION_GONE'
+    throw error
+  }
+  if (!info.entry.isDirectory() || info.entry.isSymbolicLink()) {
     throw new Error('refusing to delete a session directory that is no longer a plain directory')
   }
   // Remove the resolved path, not the pre-resolution spelling: a project
@@ -1975,7 +2150,15 @@ async function isTrustedSpillRoot(path) {
 async function resolveSpillRoots(locations) {
   const root = locations.spillRoot
   if (root === undefined) return undefined
-  if (locations.spillRootIsPrivate !== true) return [root]
+  if (locations.spillRootIsPrivate !== true) {
+    // A configured root is not necessarily private. Mirror the local backend's
+    // startup sweep: only an existing, non-symlinked, trusted directory may be
+    // swept. An absent root has no spill files and is safe to pass through.
+    const info = await inspectPath(root)
+    if (info.entry === undefined) return info.error === undefined ? [root] : []
+    if (!info.entry.isDirectory() || info.entry.isSymbolicLink()) return []
+    return await isTrustedSpillRoot(root) ? [root] : []
+  }
   if (!await isTrustedSpillRoot(root)) return []
   const parent = dirname(root)
   let entries
@@ -2018,7 +2201,7 @@ async function deleteSpillDirectories(roots, byId, sessionIds, catalog) {
     return { deleted: 0, kept: sessionIds.length, failed: 0, status: 'unverified' }
   }
   if (catalog === undefined || catalog.incomplete === true
-    || catalog.unaccounted.length > 0 || catalog.duplicates.length > 0) {
+    || catalog.unaccountedPaths.length > 0 || catalog.duplicates.length > 0) {
     return { deleted: 0, kept: sessionIds.length, failed: 0, status: 'unverified' }
   }
   if (hasSurvivingDescendant(byId, new Set(sessionIds))) {
@@ -2092,10 +2275,13 @@ function hasSurvivingDescendant(byId, deleted) {
     if (snapshot?.header?.isSeeded === true) return true
     if (snapshot?.header?.origin !== 'subagent') continue
     let parent = String(snapshot?.header?.parentSession ?? '')
+    // A subagent without a parent link, or inside a parent cycle, cannot prove
+    // it does not descend from the deleted tree; keep every spill locator.
+    if (parent === '') return true
     const seen = new Set([id])
     while (parent !== '') {
       if (deleted.has(parent)) return true
-      if (seen.has(parent)) break
+      if (seen.has(parent)) return true
       seen.add(parent)
       const parentSnapshot = byId.get(parent)
       // An unresolved parent may itself descend from the deleted tree. Keeping
@@ -2105,6 +2291,7 @@ function hasSurvivingDescendant(byId, deleted) {
       // through an independent non-subagent parent.
       if (parentSnapshot.header?.origin !== 'subagent') break
       parent = String(parentSnapshot.header?.parentSession ?? '')
+      if (parent === '') return true
     }
   }
   return false
@@ -2182,6 +2369,7 @@ function statusFor(result) {
     case 'not-found':
       return 404
     case 'live':
+    case 'busy':
     case 'ambiguous':
     case 'tree-incomplete':
     case 'directory-missing':
